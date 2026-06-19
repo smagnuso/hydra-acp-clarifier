@@ -296,22 +296,19 @@ describe("ClarifierBridge — MCP tools (in-memory cache)", () => {
     assert.strictEqual(cached[0].status, "closed");
     assert.strictEqual(cached[0].closureReason, "dismissed");
 
-    // attention/set should have been called with full array via setQuestions
-    const attentionSetCall = stubClient._requestLog.find(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.ok(attentionSetCall, "expected hydra-acp/attention/set to be called");
-    assert.strictEqual(attentionSetCall!.params.sessionId, sessionId);
-    assert.strictEqual(attentionSetCall!.params.reason, "questions");
-    const setPayload = attentionSetCall!.params.payload as { kind: string; questions: unknown[] };
-    assert.strictEqual(setPayload.kind, "questions");
-    assert.strictEqual(setPayload.questions.length, 1);
-
-    // attention/clear should NOT have been called
+    // The only question went to closed, so the persisted attention payload
+    // has nothing actionable left — attention/clear is called instead of set.
     const attentionClearCall = stubClient._requestLog.find(
       (r: { method: string }) => r.method === "hydra-acp/attention/clear",
     );
-    assert.strictEqual(attentionClearCall, undefined);
+    assert.ok(attentionClearCall, "expected hydra-acp/attention/clear to be called");
+    assert.strictEqual(attentionClearCall!.params.sessionId, sessionId);
+    assert.strictEqual(attentionClearCall!.params.reason, "questions");
+
+    const attentionSetCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
+    );
+    assert.strictEqual(attentionSetCall, undefined);
   });
 });
 
@@ -361,11 +358,10 @@ describe("ClarifierBridge — message/emit notifications", () => {
     );
     assert.ok(emitCall, "expected hydra-acp/message/emit to be called");
     assert.strictEqual(emitCall!.params.sessionId, sessionId);
-    assert.strictEqual(emitCall!.params.method, "hydra-acp/question/asked");
-    assert.strictEqual(emitCall!.params.route, "daemon");
+    assert.strictEqual(emitCall!.params.route, "client_broadcast");
 
-    const envelope = emitCall!.params.envelope as { sessionId: string; question: unknown };
-    assert.strictEqual(envelope.sessionId, sessionId);
+    const envelope = emitCall!.params.envelope as { sessionUpdate: string; question: unknown };
+    assert.strictEqual(envelope.sessionUpdate, "clarifier_question_asked");
     assert.ok(typeof (envelope.question as Record<string, unknown>).id === "string");
     assert.strictEqual((envelope.question as Record<string, unknown>).question, "Do you want to proceed?");
     assert.strictEqual((envelope.question as Record<string, unknown>).defaultAnswer, "Yes");
@@ -417,11 +413,10 @@ describe("ClarifierBridge — message/emit notifications", () => {
     );
     assert.ok(emitCall, "expected hydra-acp/message/emit to be called");
     assert.strictEqual(emitCall!.params.sessionId, sessionId);
-    assert.strictEqual(emitCall!.params.method, "hydra-acp/question/dismissed");
-    assert.strictEqual(emitCall!.params.route, "daemon");
+    assert.strictEqual(emitCall!.params.route, "client_broadcast");
 
-    const envelope = emitCall!.params.envelope as { sessionId: string; questionId: string; by: string };
-    assert.strictEqual(envelope.sessionId, sessionId);
+    const envelope = emitCall!.params.envelope as { sessionUpdate: string; questionId: string; by: string };
+    assert.strictEqual(envelope.sessionUpdate, "clarifier_question_dismissed");
     assert.strictEqual(envelope.questionId, "q-dismiss-test");
     assert.strictEqual(envelope.by, "agent");
   });
@@ -486,8 +481,8 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
     );
     assert.ok(emitCall);
     assert.strictEqual(emitCall!.params.sessionId, sessionId);
-    assert.strictEqual(emitCall!.params.method, "hydra-acp/question/answered");
-    const env = emitCall!.params.envelope as { questionId: string; userAnswer: string; deviated: boolean };
+    const env = emitCall!.params.envelope as { sessionUpdate: string; questionId: string; userAnswer: string; deviated: boolean };
+    assert.strictEqual(env.sessionUpdate, "clarifier_question_answered");
     assert.strictEqual(env.questionId, "q-1");
     assert.strictEqual(env.userAnswer, "No");
     assert.strictEqual(env.deviated, true);
@@ -531,17 +526,15 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
     assert.strictEqual(cached[0].deviated, false);
     assert.strictEqual(cached[0].closureReason, "default-accepted");
 
-    // attention/set should have been called (setQuestions sends full array)
-    const attentionSetCall = stubClient._requestLog.find(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.ok(attentionSetCall);
-
-    // attention/clear should NOT have been called
+    // Sole question is now closed → attention/clear, no attention/set.
     const attentionClearCall = stubClient._requestLog.find(
       (r: { method: string }) => r.method === "hydra-acp/attention/clear",
     );
-    assert.strictEqual(attentionClearCall, undefined);
+    assert.ok(attentionClearCall);
+    const attentionSetCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
+    );
+    assert.strictEqual(attentionSetCall, undefined);
   });
 
   it("unknown questionId → InvalidParams error reply", async () => {
@@ -645,21 +638,19 @@ describe("ClarifierBridge — handleDismiss (inbound /dismiss)", () => {
       (r: { method: string }) => r.method === "hydra-acp/message/emit",
     );
     assert.ok(emitCall);
-    assert.strictEqual(emitCall!.params.method, "hydra-acp/question/dismissed");
-    const env = emitCall!.params.envelope as { by: string };
+    const env = emitCall!.params.envelope as { sessionUpdate: string; by: string };
+    assert.strictEqual(env.sessionUpdate, "clarifier_question_dismissed");
     assert.strictEqual(env.by, "user");
 
-    // attention/set should have been called (setQuestions sends full array)
-    const attentionSetCall = stubClient._requestLog.find(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.ok(attentionSetCall);
-
-    // attention/clear should NOT have been called
+    // Sole question is now closed → attention/clear, no attention/set.
     const attentionClearCall = stubClient._requestLog.find(
       (r: { method: string }) => r.method === "hydra-acp/attention/clear",
     );
-    assert.strictEqual(attentionClearCall, undefined);
+    assert.ok(attentionClearCall);
+    const attentionSetCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
+    );
+    assert.strictEqual(attentionSetCall, undefined);
   });
 
   it("dismissing an already-closed question is idempotent (reply is action:stop, no further wire calls)", async () => {
@@ -855,8 +846,8 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
     const firstBlock = newPrompt[0] as { type: string; text: string };
     assert.strictEqual(firstBlock.type, "text");
     assert.ok(
-      firstBlock.text.includes("Answers to your earlier questions"),
-      "deviation block should be present",
+      firstBlock.text.includes("my answer is"),
+      "deviation block should be present (user-voice framing)",
     );
     assert.ok(
       firstBlock.text.includes("Use US dollars?"),
@@ -877,17 +868,15 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
     assert.strictEqual(cached[0].status, "closed");
     assert.strictEqual(cached[0].closureReason, "deviation-delivered");
 
-    // attention/set should have been called (setQuestions sends full array)
-    const attentionSetCall = stubClient._requestLog.find(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.ok(attentionSetCall);
-
-    // attention/clear should NOT have been called
+    // Only question went to closed → attention/clear.
     const attentionClearCall = stubClient._requestLog.find(
       (r: { method: string }) => r.method === "hydra-acp/attention/clear",
     );
-    assert.strictEqual(attentionClearCall, undefined);
+    assert.ok(attentionClearCall);
+    const attentionSetCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
+    );
+    assert.strictEqual(attentionSetCall, undefined);
   });
 
   it("multiple deviations → all listed in one block, all transition to closed", async () => {
@@ -955,17 +944,15 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
     assert.strictEqual(cached[1].status, "closed");
     assert.strictEqual(cached[1].closureReason, "deviation-delivered");
 
-    // attention/set should have been called (setQuestions sends full array)
-    const attentionSetCall = stubClient._requestLog.find(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.ok(attentionSetCall);
-
-    // attention/clear should NOT have been called
+    // All questions went to closed → attention/clear.
     const attentionClearCall = stubClient._requestLog.find(
       (r: { method: string }) => r.method === "hydra-acp/attention/clear",
     );
-    assert.strictEqual(attentionClearCall, undefined);
+    assert.ok(attentionClearCall);
+    const attentionSetCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
+    );
+    assert.strictEqual(attentionSetCall, undefined);
   });
 
   it("keeps-defaulted question is not injected (status=closed, not pending-delivery)", async () => {
@@ -1022,20 +1009,21 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
     (bridge as any).onRequest(makePromptReq(sessionId, [{ type: "text", text: "Go" }]));
     await new Promise((r) => setTimeout(r, 100));
 
-    // attention/set should have been called via setQuestions
-    const attentionCall = stubClient._requestLog.find(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.ok(attentionCall);
-    const setParams = attentionCall!.params as Record<string, unknown>;
-    assert.strictEqual(setParams.sessionId, sessionId);
-    assert.strictEqual(setParams.reason, "questions");
-
-    // attention/clear should NOT have been called
+    // The sole pending-delivery question transitions to closed during
+    // injection, so the persisted payload has nothing actionable left —
+    // attention/clear is what the bridge publishes.
     const clearCall = stubClient._requestLog.find(
       (r: { method: string }) => r.method === "hydra-acp/attention/clear",
     );
-    assert.strictEqual(clearCall, undefined);
+    assert.ok(clearCall);
+    const clearParams = clearCall!.params as Record<string, unknown>;
+    assert.strictEqual(clearParams.sessionId, sessionId);
+    assert.strictEqual(clearParams.reason, "questions");
+
+    const attentionCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
+    );
+    assert.strictEqual(attentionCall, undefined);
   });
 
   it("does not mutate the original envelope object", async () => {

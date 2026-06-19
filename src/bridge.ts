@@ -227,6 +227,7 @@ export class ClarifierBridge {
     }
 
     const dispatchKey = `${phase}:${method}`;
+    log.debug(`transformer/message: ${dispatchKey} session=${sessionId}`);
 
     switch (dispatchKey) {
       case "request:hydra-acp/question/answer":
@@ -346,6 +347,7 @@ export class ClarifierBridge {
     const envelope = (params.envelope ?? {}) as Record<string, unknown>;
 
     if (!sessionId) {
+      log.debug("prompt-intercept: no sessionId, passing through");
       this.client.reply(req.id, { action: "continue" });
       return;
     }
@@ -355,14 +357,27 @@ export class ClarifierBridge {
       (q) => q.status === "pending-delivery" && q.deviated === true,
     );
 
+    log.debug(
+      `prompt-intercept: session=${sessionId} cached=${questions.length} toInject=${toInject.length}`,
+    );
+
     if (toInject.length === 0) {
       this.client.reply(req.id, { action: "continue" });
       return;
     }
 
-    const deviationBlock =
-      "[Answers to your earlier questions:]\n" +
-      toInject.map((q) => `- Q: "${q.question}" → ${q.userAnswer}`).join("\n");
+    // Framing matters: bracketed meta-blocks ("[Answers to questions: ...]")
+    // get parsed as scaffolding the model is free to ignore. Phrasing the
+    // answers as if the user typed them — first person, declarative, no
+    // brackets — gets the agent to actually act on them. The follow-up
+    // text becomes a "P.S." style continuation of the user's voice.
+    const lines = toInject
+      .map(
+        (q) =>
+          `For my earlier question "${q.question}", my answer is: ${q.userAnswer}.`,
+      )
+      .join("\n");
+    const deviationBlock = `${lines}\n\nWith that, here is what I want next:\n`;
 
     const originalPrompt = Array.isArray(envelope.prompt)
       ? envelope.prompt
@@ -526,15 +541,18 @@ export class ClarifierBridge {
     );
   }
 
+  // Push an ephemeral session/update notification to attached clients of
+  // the target session. The daemon's "client_broadcast" route fans the
+  // envelope out as a `session/update` notification — TUI handlers react
+  // (e.g. show a banner when a new question is asked).
   private async emitQuestionAsked(
     sessionId: string,
     question: Question,
   ): Promise<void> {
     await this.client.request("hydra-acp/message/emit", {
       sessionId,
-      method: "hydra-acp/question/asked",
-      envelope: { sessionId, question },
-      route: "daemon",
+      envelope: { sessionUpdate: "clarifier_question_asked", question },
+      route: "client_broadcast",
     });
   }
 
@@ -546,9 +564,13 @@ export class ClarifierBridge {
   ): Promise<void> {
     await this.client.request("hydra-acp/message/emit", {
       sessionId,
-      method: "hydra-acp/question/answered",
-      envelope: { sessionId, questionId, userAnswer, deviated },
-      route: "daemon",
+      envelope: {
+        sessionUpdate: "clarifier_question_answered",
+        questionId,
+        userAnswer,
+        deviated,
+      },
+      route: "client_broadcast",
     });
   }
 
@@ -559,9 +581,12 @@ export class ClarifierBridge {
   ): Promise<void> {
     await this.client.request("hydra-acp/message/emit", {
       sessionId,
-      method: "hydra-acp/question/dismissed",
-      envelope: { sessionId, questionId, by },
-      route: "daemon",
+      envelope: {
+        sessionUpdate: "clarifier_question_dismissed",
+        questionId,
+        by,
+      },
+      route: "client_broadcast",
     });
   }
 
@@ -584,6 +609,7 @@ export class ClarifierBridge {
         await this.client.request("hydra-acp/transformer/attach", { sessionId });
         this.attachedSessions.add(sessionId);
         this.pendingAttach.delete(sessionId);
+        log.debug(`self-attached to ${sessionId}`);
       } catch (err) {
         const msg = (err as Error).message ?? "";
         if (msg.includes("not found")) {
@@ -591,6 +617,7 @@ export class ClarifierBridge {
           // user opens the session in the TUI (which marks it live).
           this.pendingAttach.add(sessionId);
           this.ensureActivationTimer();
+          log.debug(`self-attach deferred for ${sessionId} (cold)`);
         } else {
           log.warn(`transformer/attach failed for ${sessionId}: ${msg}`);
         }
@@ -634,15 +661,21 @@ export class ClarifierBridge {
   }
 
   async setQuestions(sessionId: string, questions: Question[]): Promise<void> {
-    if (questions.length > 0) {
-      this.sessionQuestions.set(sessionId, questions);
+    // Always keep the full list (including closed) in our in-process cache
+    // so prompt-intercept can still find pending-delivery entries and so
+    // we can answer list_open_questions consistently. But the daemon's
+    // persisted attention payload only carries non-closed entries — closed
+    // questions have no further surface to drive, and keeping them around
+    // would just leave the picker badge stuck after everything's settled.
+    this.sessionQuestions.set(sessionId, questions);
+    const actionable = questions.filter((q) => q.status !== "closed");
+    if (actionable.length > 0) {
       await this.client.request("hydra-acp/attention/set", {
         sessionId,
         reason: "questions",
-        payload: { kind: "questions", questions },
+        payload: { kind: "questions", questions: actionable },
       });
     } else {
-      this.sessionQuestions.delete(sessionId);
       await this.client.request("hydra-acp/attention/clear", {
         sessionId,
         reason: "questions",
