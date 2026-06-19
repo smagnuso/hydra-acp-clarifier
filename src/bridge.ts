@@ -33,11 +33,31 @@ export interface BridgeOptions {
   token: string;
 }
 
+// Poll interval for retrying transformer/attach against sessions that
+// had open questions at reconcile time but were cold (SessionNotFound).
+// When the user reopens such a session in the TUI, the next poll succeeds
+// and the session's chain picks up clarifier so /question/list, /answer,
+// and /dismiss route correctly. Modeled after planner's runActivationTick.
+const ACTIVATION_POLL_MS = 5_000;
+
 // One bridge per clarifier process. Owns the WS connection to the daemon
 // and routes intercepts to the question-store. Mirrors BudgeterBridge.
 export class ClarifierBridge {
   private readonly client: TransformerClient;
   private stopped = false;
+  // Sessions we believe we've attached to (via hydra-acp/transformer/attach)
+  // during this process lifetime. Best-effort cache: if the daemon dropped
+  // us from a chain for any reason, this is wrong but harmless — re-attach
+  // is idempotent on the daemon side and we'll re-add on the next MCP call.
+  private readonly attachedSessions = new Set<string>();
+  // Sessions with open questions whose first attach attempt failed because
+  // the session was cold. Polled periodically until attach succeeds.
+  private readonly pendingAttach = new Set<string>();
+  // In-flight attach promises keyed by sessionId — dedupes concurrent
+  // ensureAttached calls (e.g. when several MCP tool calls land on the
+  // same session in quick succession).
+  private readonly inFlightAttach = new Map<string, Promise<void>>();
+  private activationTimer: NodeJS.Timeout | undefined;
 
   constructor(private readonly opts: BridgeOptions) {
     this.client = new TransformerClient({
@@ -117,6 +137,13 @@ export class ClarifierBridge {
           const hasActive = questions.some(
             (q) => q.status === "open" || q.status === "pending-delivery",
           );
+          // Sessions with active questions need clarifier in their
+          // transformer chain so client→clarifier wire calls route.
+          // ensureAttached handles live sessions immediately and adds
+          // cold ones to the polling loop until they wake up.
+          if (hasActive) {
+            void this.ensureAttached(entry.name);
+          }
           // Always call publishAttentionFlag when a questions file
           // exists: hasActive → set; !hasActive → clear (defensive
           // cleanup of any stale flag left by a prior crash/restart).
@@ -405,6 +432,11 @@ export class ClarifierBridge {
     this.client.reply(reqId, {
       content: [{ type: "text", text: "noted" }],
     });
+    // Self-attach so subsequent client→clarifier wire calls (question/list
+    // /answer/dismiss) route through this session's chain. The MCP tool
+    // call itself doesn't need chain membership — it arrived via the HTTP
+    // /mcp/hydra-acp-clarifier route — but the answer-back wire path does.
+    void this.ensureAttached(sessionId);
     void this.publishAttentionFlag(sessionId);
     void this.emitQuestionAsked(sessionId, newQ).catch((err) =>
       log.error(`failed to emit question/asked: ${(err as Error).message}`),
@@ -422,6 +454,7 @@ export class ClarifierBridge {
     this.client.reply(reqId, {
       content: [{ type: "text", text: JSON.stringify(filtered) }],
     });
+    void this.ensureAttached(sessionId);
   }
 
   private async handleDismissQuestion(
@@ -465,6 +498,7 @@ export class ClarifierBridge {
     this.client.reply(reqId, {
       content: [{ type: "text", text: "dismissed" }],
     });
+    void this.ensureAttached(sessionId);
     void this.publishAttentionFlag(sessionId);
     void this.emitQuestionDismissed(sessionId, id, "agent").catch((err) =>
       log.error(`failed to emit question/dismissed: ${(err as Error).message}`),
@@ -510,7 +544,71 @@ export class ClarifierBridge {
     });
   }
 
- private async publishAttentionFlag(sessionId: string): Promise<void> {
+  // Self-attach to a session's transformer chain so client→clarifier wire
+  // calls (hydra-acp/question/answer, /dismiss, /list) route to us. Idempotent
+  // on both sides — we skip the wire call if we've already attached, and the
+  // daemon's transformer/attach handler is itself idempotent. Failures from a
+  // cold session (SessionNotFound) move the session to pendingAttach so the
+  // polling loop retries when the user reopens it.
+  private async ensureAttached(sessionId: string): Promise<void> {
+    if (this.attachedSessions.has(sessionId)) {
+      return;
+    }
+    const existing = this.inFlightAttach.get(sessionId);
+    if (existing) {
+      return existing;
+    }
+    const promise = (async () => {
+      try {
+        await this.client.request("hydra-acp/transformer/attach", { sessionId });
+        this.attachedSessions.add(sessionId);
+        this.pendingAttach.delete(sessionId);
+      } catch (err) {
+        const msg = (err as Error).message ?? "";
+        if (msg.includes("not found")) {
+          // Cold session — schedule a retry. Picked up the next time the
+          // user opens the session in the TUI (which marks it live).
+          this.pendingAttach.add(sessionId);
+          this.ensureActivationTimer();
+        } else {
+          log.warn(`transformer/attach failed for ${sessionId}: ${msg}`);
+        }
+      } finally {
+        this.inFlightAttach.delete(sessionId);
+      }
+    })();
+    this.inFlightAttach.set(sessionId, promise);
+    return promise;
+  }
+
+  private ensureActivationTimer(): void {
+    if (this.activationTimer || this.pendingAttach.size === 0 || this.stopped) {
+      return;
+    }
+    this.activationTimer = setInterval(() => {
+      void this.runActivationTick();
+    }, ACTIVATION_POLL_MS);
+    this.activationTimer.unref?.();
+  }
+
+  private async runActivationTick(): Promise<void> {
+    if (this.pendingAttach.size === 0) {
+      if (this.activationTimer) {
+        clearInterval(this.activationTimer);
+        this.activationTimer = undefined;
+      }
+      return;
+    }
+    // Snapshot so iteration isn't affected by ensureAttached's mutations.
+    const sessions = Array.from(this.pendingAttach);
+    await Promise.all(sessions.map((sid) => this.ensureAttached(sid)));
+    if (this.pendingAttach.size === 0 && this.activationTimer) {
+      clearInterval(this.activationTimer);
+      this.activationTimer = undefined;
+    }
+  }
+
+  private async publishAttentionFlag(sessionId: string): Promise<void> {
     try {
       const questions = await loadQuestions(sessionId);
       const active = questions.filter(
@@ -562,6 +660,10 @@ export class ClarifierBridge {
       return;
     }
     this.stopped = true;
+    if (this.activationTimer) {
+      clearInterval(this.activationTimer);
+      this.activationTimer = undefined;
+    }
     this.client.stop();
   }
 }
