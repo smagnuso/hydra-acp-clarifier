@@ -159,10 +159,12 @@ describe("handleMcpInvoke — note_question", () => {
       method: "hydra-acp/mcp_tools/invoke",
       params: {
         sessionId,
-        method: "note_question",
-        question: "What is the capital of France?",
-        default_answer: "Paris",
-        options: ["Paris", "Lyon", "Marseille"],
+        tool: "note_question",
+        args: {
+          question: "What is the capital of France?",
+          default_answer: "Paris",
+          options: ["Paris", "Lyon", "Marseille"],
+        },
       },
     };
 
@@ -204,8 +206,8 @@ describe("handleMcpInvoke — note_question", () => {
       method: "hydra-acp/mcp_tools/invoke",
       params: {
         sessionId,
-        method: "note_question",
-        question: "Missing default",
+        tool: "note_question",
+        args: { question: "Missing default" },
       },
     };
 
@@ -267,7 +269,8 @@ describe("handleMcpInvoke — list_open_questions", () => {
       method: "hydra-acp/mcp_tools/invoke",
       params: {
         sessionId,
-        method: "list_open_questions",
+        tool: "list_open_questions",
+        args: {},
       },
     };
 
@@ -303,7 +306,8 @@ describe("handleMcpInvoke — list_open_questions", () => {
       method: "hydra-acp/mcp_tools/invoke",
       params: {
         sessionId,
-        method: "list_open_questions",
+        tool: "list_open_questions",
+        args: {},
       },
     };
 
@@ -361,8 +365,8 @@ describe("handleMcpInvoke — dismiss_question", () => {
       method: "hydra-acp/mcp_tools/invoke",
       params: {
         sessionId,
-        method: "dismiss_question",
-        id: q.id,
+        tool: "dismiss_question",
+        args: { id: q.id },
       },
     };
 
@@ -405,8 +409,8 @@ describe("handleMcpInvoke — dismiss_question", () => {
       method: "hydra-acp/mcp_tools/invoke",
       params: {
         sessionId,
-        method: "dismiss_question",
-        id: "nonexistent-id-00000",
+        tool: "dismiss_question",
+        args: { id: "nonexistent-id-00000" },
       },
     };
 
@@ -436,7 +440,8 @@ describe("handleMcpInvoke — dismiss_question", () => {
       method: "hydra-acp/mcp_tools/invoke",
       params: {
         sessionId,
-        method: "dismiss_question",
+        tool: "dismiss_question",
+        args: {},
       },
     };
 

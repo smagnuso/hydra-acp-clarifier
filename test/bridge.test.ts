@@ -153,8 +153,9 @@ describe("ClarifierBridge — dispatch shape", () => {
       id: 99,
       method: "hydra-acp/mcp_tools/invoke",
       params: {
-        method: "note_question",
+        tool: "note_question",
         sessionId: "test-session",
+        args: {},
       },
     };
 
@@ -229,11 +230,13 @@ describe("ClarifierBridge — attention flag", () => {
       id: reqId,
       method: "hydra-acp/mcp_tools/invoke",
       params: {
-        method: "note_question",
+        tool: "note_question",
         sessionId,
-        question: "What is the capital of France?",
-        default_answer: "Paris",
-        options: ["Paris", "London", "Berlin"],
+        args: {
+          question: "What is the capital of France?",
+          default_answer: "Paris",
+          options: ["Paris", "London", "Berlin"],
+        },
       },
     };
 
@@ -292,9 +295,9 @@ describe("ClarifierBridge — attention flag", () => {
       id: reqId,
       method: "hydra-acp/mcp_tools/invoke",
       params: {
-        method: "dismiss_question",
+        tool: "dismiss_question",
         sessionId,
-        id: "q-1",
+        args: { id: "q-1" },
       },
     };
 
@@ -357,11 +360,13 @@ describe("ClarifierBridge — message/emit notifications", () => {
       id: reqId,
       method: "hydra-acp/mcp_tools/invoke",
       params: {
-        method: "note_question",
+        tool: "note_question",
         sessionId,
-        question: "Do you want to proceed?",
-        default_answer: "Yes",
-        options: ["Yes", "No"],
+        args: {
+          question: "Do you want to proceed?",
+          default_answer: "Yes",
+          options: ["Yes", "No"],
+        },
       },
     };
 
@@ -422,9 +427,9 @@ describe("ClarifierBridge — message/emit notifications", () => {
       id: reqId,
       method: "hydra-acp/mcp_tools/invoke",
       params: {
-        method: "dismiss_question",
+        tool: "dismiss_question",
         sessionId,
-        id: "q-dismiss-test",
+        args: { id: "q-dismiss-test" },
       },
     };
 

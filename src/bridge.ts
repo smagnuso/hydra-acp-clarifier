@@ -340,9 +340,17 @@ export class ClarifierBridge {
   }
 
   private async handleMcpInvoke(req: JsonRpcRequest): Promise<void> {
-    const params = (req.params ?? {}) as Record<string, unknown>;
-    const method = typeof params.method === "string" ? params.method : "";
+    const params = (req.params ?? {}) as {
+      server?: unknown;
+      tool?: unknown;
+      args?: unknown;
+      sessionId?: unknown;
+    };
+    const tool = typeof params.tool === "string" ? params.tool : "";
     const sessionId = typeof params.sessionId === "string" ? params.sessionId : "";
+    const args = (params.args && typeof params.args === "object"
+      ? (params.args as Record<string, unknown>)
+      : {}) as Record<string, unknown>;
 
     if (!sessionId) {
       this.client.reply(req.id, {
@@ -352,20 +360,20 @@ export class ClarifierBridge {
       return;
     }
 
-    switch (method) {
+    switch (tool) {
       case "note_question":
-        await this.handleNoteQuestion(req.id, sessionId, params);
+        await this.handleNoteQuestion(req.id, sessionId, args);
         break;
       case "list_open_questions":
         await this.handleListOpenQuestions(req.id, sessionId);
         break;
       case "dismiss_question":
-        await this.handleDismissQuestion(req.id, sessionId, params);
+        await this.handleDismissQuestion(req.id, sessionId, args);
         break;
       default:
-        log.warn(`unknown MCP tool method: ${method}`);
+        log.warn(`unknown MCP tool: '${tool}'`);
         this.client.reply(req.id, {
-          content: [{ type: "text", text: `unknown clarifier tool: ${method}` }],
+          content: [{ type: "text", text: `unknown clarifier tool: '${tool}'` }],
           isError: true,
         });
     }
