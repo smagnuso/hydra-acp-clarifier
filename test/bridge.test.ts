@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
@@ -510,7 +510,10 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
     (bridge as any).onRequest(makeAnswerReq(sessionId, "q-1", "No"));
     await new Promise((r) => setTimeout(r, 100));
 
-    assert.deepStrictEqual(stubClient._lastReply.payload, { ok: true });
+    assert.deepStrictEqual(stubClient._lastReply.payload, {
+      action: "stop",
+      payload: { ok: true },
+    });
 
     const saved = JSON.parse(readFileSync(qPath, "utf-8")) as typeof question;
     assert.strictEqual(saved[0].status, "pending-delivery");
@@ -561,7 +564,10 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
     (bridge as any).onRequest(makeAnswerReq(sessionId, "q-2", "Yes"));
     await new Promise((r) => setTimeout(r, 100));
 
-    assert.deepStrictEqual(stubClient._lastReply.payload, { ok: true });
+    assert.deepStrictEqual(stubClient._lastReply.payload, {
+      action: "stop",
+      payload: { ok: true },
+    });
 
     const saved = JSON.parse(readFileSync(qPath, "utf-8")) as typeof question;
     assert.strictEqual(saved[0].status, "closed");
@@ -592,6 +598,44 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
 
     assert.ok(stubClient._lastReplyError);
     assert.strictEqual(stubClient._lastReplyError.code, -32602);
+  });
+
+  it("answering an already-closed question is refused with InvalidParams (no state change)", async () => {
+    setupTmpHome();
+    const stubClient = makeStubClient();
+    const bridge = new ClarifierBridge({ daemonWsUrl: "ws://stub", token: "stub" });
+    (bridge as any).client = stubClient;
+    const sessionId = "session-answer-already-closed";
+    const question = [
+      {
+        id: "q-locked",
+        question: "Q",
+        defaultAnswer: "yes",
+        askedAt: Date.now(),
+        status: "closed" as const,
+        closureReason: "default-accepted" as const,
+      },
+    ];
+    const qPath = resolve(
+      tmpHome,
+      "sessions",
+      sessionId,
+      "clarifier-questions.json",
+    );
+    mkdirSync(dirname(qPath), { recursive: true });
+    writeFileSync(qPath, JSON.stringify(question));
+
+    (bridge as any).onRequest(makeAnswerReq(sessionId, "q-locked", "no"));
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.ok(stubClient._lastReplyError, "expected error reply");
+    assert.strictEqual(stubClient._lastReplyError.code, -32602);
+
+    // On-disk state must be unchanged.
+    const saved = JSON.parse(readFileSync(qPath, "utf-8")) as typeof question;
+    assert.strictEqual(saved[0].status, "closed");
+    assert.strictEqual(saved[0].closureReason, "default-accepted");
+    assert.strictEqual(saved[0].userAnswer, undefined);
   });
 });
 
@@ -654,7 +698,10 @@ describe("ClarifierBridge — handleDismiss (inbound /dismiss)", () => {
     (bridge as any).onRequest(makeDismissReq(sessionId, "q-dismiss-inbound"));
     await new Promise((r) => setTimeout(r, 100));
 
-    assert.deepStrictEqual(stubClient._lastReply.payload, { ok: true });
+    assert.deepStrictEqual(stubClient._lastReply.payload, {
+      action: "stop",
+      payload: { ok: true },
+    });
 
     const saved = JSON.parse(readFileSync(qPath, "utf-8")) as typeof question;
     assert.strictEqual(saved[0].status, "closed");
@@ -672,6 +719,44 @@ describe("ClarifierBridge — handleDismiss (inbound /dismiss)", () => {
       (r) => r.method === "hydra-acp/attention/clear",
     );
     assert.ok(attentionClearCall);
+  });
+
+  it("dismissing an already-closed question is idempotent (reply is action:stop, no further wire calls)", async () => {
+    setupTmpHome();
+    const stubClient = makeStubClient();
+    const bridge = new ClarifierBridge({ daemonWsUrl: "ws://stub", token: "stub" });
+    (bridge as any).client = stubClient;
+    const sessionId = "session-dismiss-idempotent";
+    const question = [
+      {
+        id: "q-already-closed",
+        question: "Q",
+        defaultAnswer: "yes",
+        askedAt: Date.now(),
+        status: "closed" as const,
+        closureReason: "dismissed" as const,
+      },
+    ];
+    const qPath = resolve(
+      tmpHome,
+      "sessions",
+      sessionId,
+      "clarifier-questions.json",
+    );
+    mkdirSync(dirname(qPath), { recursive: true });
+    writeFileSync(qPath, JSON.stringify(question));
+
+    (bridge as any).onRequest(makeDismissReq(sessionId, "q-already-closed"));
+    await new Promise((r) => setTimeout(r, 100));
+
+    assert.deepStrictEqual(stubClient._lastReply.payload, {
+      action: "stop",
+      payload: { ok: true },
+    });
+    const emitCall = stubClient._requestLog.find(
+      (r) => r.method === "hydra-acp/message/emit",
+    );
+    assert.strictEqual(emitCall, undefined, "no notification should fire for an idempotent dismiss");
   });
 });
 
@@ -752,7 +837,8 @@ describe("ClarifierBridge — handleList (inbound /list)", () => {
     await new Promise((r) => setTimeout(r, 50));
 
     assert.deepStrictEqual(stubClient._lastReply.payload, {
-      questions: [questions[0], questions[1]],
+      action: "stop",
+      payload: { questions: [questions[0], questions[1]] },
     });
   });
 });

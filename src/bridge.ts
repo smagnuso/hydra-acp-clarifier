@@ -99,11 +99,20 @@ export class ClarifierBridge {
         if (!entry.isDirectory()) continue;
         try {
           const questions = await loadQuestions(entry.name);
+          // No questions file (or empty) → nothing for clarifier to
+          // reconcile. Skip without calling attention/clear, which would
+          // be wasteful on installs with many sessions.
+          if (questions.length === 0) {
+            continue;
+          }
           const hasActive = questions.some(
             (q) => q.status === "open" || q.status === "pending-delivery",
           );
+          // Always call publishAttentionFlag when a questions file
+          // exists: hasActive → set; !hasActive → clear (defensive
+          // cleanup of any stale flag left by a prior crash/restart).
           await this.publishAttentionFlag(entry.name);
-          if (hasActive && questions.length > 0) {
+          if (hasActive) {
             republishedCount++;
           }
         } catch (err) {
@@ -189,6 +198,10 @@ export class ClarifierBridge {
     }
 
     const existing = questions[idx]!;
+    if (existing.status === "closed") {
+      this.client.replyError(req.id, -32602, `InvalidParams: question '${questionId}' is already closed (${existing.closureReason ?? "unknown reason"})`);
+      return;
+    }
     const deviated = answer !== existing.defaultAnswer;
     questions[idx] = {
       ...existing,
@@ -199,7 +212,7 @@ export class ClarifierBridge {
     };
     await saveQuestions(sessionId, questions);
 
-    this.client.reply(req.id, { ok: true });
+    this.client.reply(req.id, { action: "stop", payload: { ok: true } });
     void this.publishAttentionFlag(sessionId);
     void this.emitQuestionAnswered(sessionId, questionId, answer, deviated).catch((err) =>
       log.error(`failed to emit question/answered: ${(err as Error).message}`),
@@ -225,6 +238,10 @@ export class ClarifierBridge {
     }
 
     const existing = questions[idx]!;
+    if (existing.status === "closed") {
+      this.client.reply(req.id, { action: "stop", payload: { ok: true } });
+      return;
+    }
     questions[idx] = {
       ...existing,
       status: "closed",
@@ -232,7 +249,7 @@ export class ClarifierBridge {
     };
     await saveQuestions(sessionId, questions);
 
-    this.client.reply(req.id, { ok: true });
+    this.client.reply(req.id, { action: "stop", payload: { ok: true } });
     void this.publishAttentionFlag(sessionId);
     void this.emitQuestionDismissed(sessionId, questionId, "user").catch((err) =>
       log.error(`failed to emit question/dismissed: ${(err as Error).message}`),
@@ -253,7 +270,7 @@ export class ClarifierBridge {
       (q) => q.status === "open" || q.status === "pending-delivery",
     );
 
-    this.client.reply(req.id, { questions: active });
+    this.client.reply(req.id, { action: "stop", payload: { questions: active } });
   }
 
   private async handlePromptIntercept(req: JsonRpcRequest): Promise<void> {
@@ -416,6 +433,12 @@ export class ClarifierBridge {
     }
 
     const existing = questions[idx]!;
+    if (existing.status === "closed") {
+      this.client.reply(reqId, {
+        content: [{ type: "text", text: "already closed" }],
+      });
+      return;
+    }
     questions[idx] = {
       ...existing,
       status: "closed",
