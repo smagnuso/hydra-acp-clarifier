@@ -51,6 +51,15 @@ export class ClarifierBridge {
     this.client.on("open", () => this.onOpen());
     this.client.on("request", (req) => this.onRequest(req));
     this.client.on("notification", (note) => this.onNotification(note));
+    // EventEmitter throws an unhandled-error exception (and crashes the
+    // process) if `error` has no listener. Always attach one; the daemon
+    // will restart us if we exit, so logging-and-continuing is the right
+    // default. Without this, any WS error during handshake (e.g. a
+    // transient ECONNRESET, invalid token, daemon not yet up) crashes
+    // the process and produces a restart loop.
+    this.client.on("error", (err) => {
+      log.warn(`client error: ${err.message}`);
+    });
     this.client.on("close", ({ hadError }) => {
       if (!this.stopped) {
         log.warn(`client disconnected unexpectedly (hadError=${hadError})`);

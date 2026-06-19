@@ -1534,3 +1534,26 @@ describe("ClarifierBridge — lifecycle event handlers", () => {
     assert.strictEqual(stubClient._requestLog.length, 0);
   });
 });
+
+describe("ClarifierBridge — error event handling", () => {
+  it("attaches an 'error' listener so an emitted error does not crash the process", () => {
+    const stubClient = makeStubClient();
+    const bridge = new ClarifierBridge({
+      daemonWsUrl: "ws://stub",
+      token: "stub",
+    });
+    (bridge as any).client = stubClient;
+
+    // Call start() to register listeners. The stub's start() is a no-op,
+    // so no actual WS work happens — but the bridge.on(...) calls run.
+    (bridge as any).start();
+
+    // EventEmitter throws 'Unhandled error' synchronously when there's no
+    // listener. If the bridge dropped the error listener (regression), this
+    // emit would propagate as an uncaught exception and the test runner
+    // would fail with an unhandled-error report.
+    assert.doesNotThrow(() => {
+      (stubClient as unknown as EventEmitter).emit("error", new Error("simulated ws hang up"));
+    });
+  });
+});
