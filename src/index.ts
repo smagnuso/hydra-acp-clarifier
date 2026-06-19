@@ -2,6 +2,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ClarifierBridge } from "./bridge.js";
 import { logger, setDebug } from "./util/log.js";
 
 const log = logger("main");
@@ -53,12 +54,26 @@ async function main(): Promise<void> {
 
   log.info(`hydra-acp-clarifier ${readVersion()} starting`);
 
-  // TODO: instantiate ClarifierBridge and start it.
-  // const bridge = new ClarifierBridge({ ... });
-  // bridge.start();
+  const daemonWsUrl = process.env.HYDRA_ACP_DAEMON_WS ?? "ws://127.0.0.1:55514/acp";
+  const token = process.env.HYDRA_ACP_TOKEN;
+  if (!token) {
+    log.error("HYDRA_ACP_TOKEN must be set");
+    process.exit(1);
+  }
 
-  log.warn("clarifier bridge not yet implemented; exiting");
-  process.exit(0);
+  const bridge = new ClarifierBridge({ daemonWsUrl, token });
+  bridge.start();
+
+  process.on("SIGTERM", () => {
+    log.info("received SIGTERM, shutting down");
+    bridge.stop();
+    process.exit(0);
+  });
+  process.on("SIGINT", () => {
+    log.info("received SIGINT, shutting down");
+    bridge.stop();
+    process.exit(0);
+  });
 }
 
 main().catch((err: unknown) => {
