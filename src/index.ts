@@ -33,9 +33,9 @@ Options:
   --help       Show this help.
 
 Environment:
-  HYDRA_ACP_HOME       Hydra data directory (default: ~/.hydra-acp)
-  HYDRA_ACP_DAEMON_WS  Daemon websocket URL (injected by hydra-acp on spawn).
-  HYDRA_ACP_TOKEN      Per-process transformer token (injected by hydra-acp).
+  HYDRA_ACP_HOME     Hydra data directory (default: ~/.hydra-acp)
+  HYDRA_ACP_WS_URL   Daemon websocket URL (injected by hydra-acp on spawn).
+  HYDRA_ACP_TOKEN    Per-process transformer token (injected by hydra-acp).
 `;
 
 async function main(): Promise<void> {
@@ -54,10 +54,14 @@ async function main(): Promise<void> {
 
   log.info(`hydra-acp-clarifier ${readVersion()} starting`);
 
-  const daemonWsUrl = process.env.HYDRA_ACP_DAEMON_WS ?? "ws://127.0.0.1:55514/acp";
+  const daemonWsUrl = process.env.HYDRA_ACP_WS_URL;
+  if (!daemonWsUrl) {
+    log.error("HYDRA_ACP_WS_URL must be set (injected by hydra-acp on spawn)");
+    process.exit(1);
+  }
   const token = process.env.HYDRA_ACP_TOKEN;
   if (!token) {
-    log.error("HYDRA_ACP_TOKEN must be set");
+    log.error("HYDRA_ACP_TOKEN must be set (injected by hydra-acp on spawn)");
     process.exit(1);
   }
 
