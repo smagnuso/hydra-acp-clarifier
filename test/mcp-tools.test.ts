@@ -107,6 +107,7 @@ function makeStubClient() {
       lastReply.id = id;
       lastReply.payload = payload;
     },
+    request: async (_method: string, _params: unknown) => ({ ok: true }),
     _replies: replies,
     _lastReply: lastReply,
   };
@@ -141,6 +142,7 @@ describe("handleMcpInvoke — note_question", () => {
     const { ClarifierBridge } = await loadBridge();
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
 
@@ -176,9 +178,8 @@ describe("handleMcpInvoke — note_question", () => {
     assert.strictEqual(reply.content[0].type, "text");
     assert.strictEqual(reply.content[0].text, "noted");
 
-    // Verify the question was persisted to the store
-    const { loadQuestions } = await import("../src/store.js");
-    const questions = await loadQuestions(sessionId);
+    // Verify the question was cached in memory
+    const questions = (bridge as any).getQuestions(sessionId);
     assert.strictEqual(questions.length, 1);
     assert.strictEqual(questions[0].question, "What is the capital of France?");
     assert.strictEqual(questions[0].defaultAnswer, "Paris");
@@ -190,6 +191,7 @@ describe("handleMcpInvoke — note_question", () => {
     const { ClarifierBridge } = await loadBridge();
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
 
@@ -240,21 +242,21 @@ describe("handleMcpInvoke — list_open_questions", () => {
   });
 
   it("returns only open and pending-delivery questions", async () => {
-    const { saveQuestions } = await import("../src/store.js");
+    const { ClarifierBridge } = await loadBridge();
+    const bridge = new ClarifierBridge({
+      daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
+      token: "test-token",
+    });
 
+    // Pre-populate the in-memory cache
     const q1 = newQuestion({ question: "Open Q", defaultAnswer: "A" });
     const q2 = newQuestion({ question: "Pending Q", defaultAnswer: "B" });
     const q3 = newQuestion({ question: "Closed Q", defaultAnswer: "C" });
     q3.status = "closed";
     q3.closureReason = "dismissed";
 
-    await saveQuestions(sessionId, [q1, q2, q3]);
-
-    const { ClarifierBridge } = await loadBridge();
-    const bridge = new ClarifierBridge({
-      daemonWsUrl: "ws://127.0.0.1:55514/acp",
-      token: "test-token",
-    });
+    (bridge as any).sessionQuestions.set(sessionId, [q1, q2, q3]);
 
     const stubClient = makeStubClient();
     (bridge as any).client = {
@@ -290,6 +292,7 @@ describe("handleMcpInvoke — list_open_questions", () => {
     const { ClarifierBridge } = await loadBridge();
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
 
@@ -341,16 +344,16 @@ describe("handleMcpInvoke — dismiss_question", () => {
   });
 
   it("marks a question as closed with dismissal reason", async () => {
-    const { saveQuestions, loadQuestions } = await import("../src/store.js");
-
-    const q = newQuestion({ question: "Dismiss me", defaultAnswer: "No" });
-    await saveQuestions(sessionId, [q]);
-
     const { ClarifierBridge } = await loadBridge();
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
+
+    // Pre-populate the in-memory cache
+    const q = newQuestion({ question: "Dismiss me", defaultAnswer: "No" });
+    (bridge as any).sessionQuestions.set(sessionId, [q]);
 
     const stubClient = makeStubClient();
     (bridge as any).client = {
@@ -376,25 +379,24 @@ describe("handleMcpInvoke — dismiss_question", () => {
     assert.strictEqual(reply.isError, undefined);
     assert.strictEqual(reply.content[0].text, "dismissed");
 
-    // Verify persistence
-    const questions = await loadQuestions(sessionId);
+    // Verify cache was updated
+    const questions = (bridge as any).getQuestions(sessionId);
     assert.strictEqual(questions.length, 1);
     assert.strictEqual(questions[0].status, "closed");
     assert.strictEqual(questions[0].closureReason, "dismissed");
   });
 
   it("returns error for unknown id", async () => {
-    const { saveQuestions } = await import("../src/store.js");
-
-    // Save a question with a different id
-    const q = newQuestion({ question: "Different Q", defaultAnswer: "A" });
-    await saveQuestions(sessionId, [q]);
-
     const { ClarifierBridge } = await loadBridge();
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
+
+    // Pre-populate the in-memory cache with a question of different id
+    const q = newQuestion({ question: "Different Q", defaultAnswer: "A" });
+    (bridge as any).sessionQuestions.set(sessionId, [q]);
 
     const stubClient = makeStubClient();
     (bridge as any).client = {
@@ -424,6 +426,7 @@ describe("handleMcpInvoke — dismiss_question", () => {
     const { ClarifierBridge } = await loadBridge();
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
 

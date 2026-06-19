@@ -8,22 +8,15 @@ function hydraHome(): string {
   return process.env.HYDRA_ACP_HOME ?? resolve(homedir(), ".hydra-acp");
 }
 
-// Per-session question store. Each session's questions live in
-// <home>/sessions/<sessionId>/clarifier-questions.json, alongside the
-// session's own meta.json and history.jsonl. Co-located so removing a
-// session also removes its clarifier state.
-export function questionsFilePath(sessionId: string): string {
-  return resolve(
-    hydraHome(),
-    "sessions",
-    sessionId,
-    "clarifier-questions.json",
-  );
-}
-
-// Directory enumerated at startup to discover sessions that may have
-// pending questions (for reconcile and cross-session listing without
-// having to ask the daemon for every session).
+// Directory used at startup for one-shot migration of legacy
+// clarifier-questions.json files (pre-attention-flag-only persistence).
+// After migration completes there's no recurring need to enumerate sessions —
+// state lives in the daemon's attention flags. Kept for the migration scan.
 export function sessionsDir(): string {
   return resolve(hydraHome(), "sessions");
 }
+
+// Legacy per-session questions file path. Only referenced by the one-shot
+// migration scan in bridge.ts (which builds the path inline now). Removed
+// from the public API as part of the attention-flag-only persistence
+// consolidation.

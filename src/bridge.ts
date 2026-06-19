@@ -1,10 +1,9 @@
-import { readdir } from "node:fs/promises";
+import { readdir, readFile, unlink } from "node:fs/promises";
 import { TransformerClient } from "./acp/transformer.js";
 import type { JsonRpcRequest, JsonRpcNotification, TransformerSessionEvent } from "./acp/protocol.js";
 import { logger } from "./util/log.js";
 import { CLARIFIER_MCP_INSTRUCTIONS, CLARIFIER_MCP_TOOLS } from "./mcp-tools.js";
-import { loadQuestions, saveQuestions } from "./store.js";
-import { newQuestion, type Question } from "./question.js";
+import { newQuestion, QuestionArraySchema, type Question } from "./question.js";
 import { sessionsDir } from "./paths.js";
 
 const log = logger("bridge");
@@ -30,6 +29,7 @@ export const CLARIFIER_INTERCEPTS = [
 
 export interface BridgeOptions {
   daemonWsUrl: string;
+  daemonUrl: string;
   token: string;
 }
 
@@ -58,6 +58,7 @@ export class ClarifierBridge {
   // same session in quick succession).
   private readonly inFlightAttach = new Map<string, Promise<void>>();
   private activationTimer: NodeJS.Timeout | undefined;
+  private readonly sessionQuestions = new Map<string, Question[]>();
 
   constructor(private readonly opts: BridgeOptions) {
     this.client = new TransformerClient({
@@ -118,54 +119,86 @@ export class ClarifierBridge {
     log.info("registering slash commands (placeholder)");
   }
 
+  // Startup recovery. Two stages:
+  //
+  //   1. One-shot file migration: scan ~/.hydra-acp/sessions/*/clarifier-questions.json
+  //      from prior persistence layout. For each, push to the daemon's
+  //      attention flag and delete the file. Idempotent — after first run,
+  //      no files exist.
+  //
+  //   2. Daemon-side load: GET /v1/sessions/attention?source=hydra-acp-clarifier
+  //      to populate the in-memory cache with all our existing flags
+  //      (including ones we just migrated in stage 1).
+  //
+  // Finally, for each session with active questions, schedule self-attach
+  // so client→clarifier wire calls route through the session's chain.
   private async reconcile(): Promise<void> {
+    let migratedFiles = 0;
     try {
       const dirs = await readdir(sessionsDir(), { withFileTypes: true });
-      let republishedCount = 0;
-      const errors: string[] = [];
-
       for (const entry of dirs) {
         if (!entry.isDirectory()) continue;
+        const filePath = `${sessionsDir()}/${entry.name}/clarifier-questions.json`;
         try {
-          const questions = await loadQuestions(entry.name);
-          // No questions file (or empty) → nothing for clarifier to
-          // reconcile. Skip without calling attention/clear, which would
-          // be wasteful on installs with many sessions.
-          if (questions.length === 0) {
+          const raw = await readFile(filePath, "utf-8");
+          const parsed = JSON.parse(raw);
+          const result = QuestionArraySchema.safeParse(parsed);
+          if (!result.success) {
+            log.warn(`clarifier migrate: parse failed for ${filePath}: ${result.error.message}`);
             continue;
           }
-          const hasActive = questions.some(
-            (q) => q.status === "open" || q.status === "pending-delivery",
-          );
-          // Sessions with active questions need clarifier in their
-          // transformer chain so client→clarifier wire calls route.
-          // ensureAttached handles live sessions immediately and adds
-          // cold ones to the polling loop until they wake up.
-          if (hasActive) {
-            void this.ensureAttached(entry.name);
+          if (result.data.length === 0) {
+            await unlink(filePath).catch(() => undefined);
+            continue;
           }
-          // Always call publishAttentionFlag when a questions file
-          // exists: hasActive → set; !hasActive → clear (defensive
-          // cleanup of any stale flag left by a prior crash/restart).
-          await this.publishAttentionFlag(entry.name);
-          if (hasActive) {
-            republishedCount++;
-          }
+          // Push to daemon via setQuestions (handles attention/set
+          // and updates in-memory cache as a side-effect).
+          await this.setQuestions(entry.name, result.data);
+          await unlink(filePath);
+          migratedFiles++;
         } catch (err) {
-          errors.push(`session ${entry.name}: ${(err as Error).message}`);
+          const code = (err as { code?: string })?.code;
+          if (code === "ENOENT") {
+            // No file for this session — normal post-migration state.
+            continue;
+          }
+          log.warn(`clarifier migrate: error on ${entry.name}: ${(err as Error).message}`);
         }
       }
-
-      log.info(
-        `clarifier reconcile: republished ${republishedCount} attention flags across ${dirs.filter((e) => e.isDirectory()).length} sessions`,
-      );
-
-      if (errors.length > 0) {
-        log.warn(`clarifier reconcile: encountered errors for ${errors.length} session(s): ${errors.join("; ")}`);
-      }
     } catch (err) {
-      log.error(`clarifier reconcile failed: ${(err as Error).message}`);
+      const code = (err as { code?: string })?.code;
+      if (code !== "ENOENT") {
+        log.warn(`clarifier migrate: scan failed: ${(err as Error).message}`);
+      }
     }
+
+    // Stage 2: populate the in-memory cache from the daemon's stored flags.
+    // After the migration above, all our state is in the daemon, so this
+    // single fetch is the canonical "what does the clarifier own" load.
+    try {
+      await this.populateQuestionsCache();
+    } catch (err) {
+      log.warn(`clarifier reconcile: populate failed: ${(err as Error).message}`);
+    }
+
+    // Schedule self-attach for every session with active questions so
+    // client→clarifier wire calls (question/list / answer / dismiss)
+    // route through the session's transformer chain. Cold sessions go
+    // into the polling loop and attach when they wake up.
+    let activeSessions = 0;
+    for (const [sessionId, questions] of this.sessionQuestions) {
+      const hasActive = questions.some(
+        (q) => q.status === "open" || q.status === "pending-delivery",
+      );
+      if (hasActive) {
+        activeSessions++;
+        void this.ensureAttached(sessionId);
+      }
+    }
+
+    log.info(
+      `clarifier reconcile: migrated ${migratedFiles} file(s), restored ${this.sessionQuestions.size} session(s), ${activeSessions} active`,
+    );
   }
 
   private onRequest(req: JsonRpcRequest): void {
@@ -226,7 +259,7 @@ export class ClarifierBridge {
       return;
     }
 
-    const questions = await loadQuestions(sessionId);
+    const questions = this.getQuestions(sessionId);
     const idx = questions.findIndex((q) => q.id === questionId);
     if (idx === -1) {
       this.client.replyError(req.id, -32602, `InvalidParams: no question found with id '${questionId}'`);
@@ -246,10 +279,9 @@ export class ClarifierBridge {
       status: deviated ? "pending-delivery" : "closed",
       closureReason: deviated ? undefined : "default-accepted",
     };
-    await saveQuestions(sessionId, questions);
+    await this.setQuestions(sessionId, questions);
 
     this.client.reply(req.id, { action: "stop", payload: { ok: true } });
-    void this.publishAttentionFlag(sessionId);
     void this.emitQuestionAnswered(sessionId, questionId, answer, deviated).catch((err) =>
       log.error(`failed to emit question/answered: ${(err as Error).message}`),
     );
@@ -266,7 +298,7 @@ export class ClarifierBridge {
       return;
     }
 
-    const questions = await loadQuestions(sessionId);
+    const questions = this.getQuestions(sessionId);
     const idx = questions.findIndex((q) => q.id === questionId);
     if (idx === -1) {
       this.client.replyError(req.id, -32602, `InvalidParams: no question found with id '${questionId}'`);
@@ -283,10 +315,9 @@ export class ClarifierBridge {
       status: "closed",
       closureReason: "dismissed",
     };
-    await saveQuestions(sessionId, questions);
+    await this.setQuestions(sessionId, questions);
 
     this.client.reply(req.id, { action: "stop", payload: { ok: true } });
-    void this.publishAttentionFlag(sessionId);
     void this.emitQuestionDismissed(sessionId, questionId, "user").catch((err) =>
       log.error(`failed to emit question/dismissed: ${(err as Error).message}`),
     );
@@ -301,7 +332,7 @@ export class ClarifierBridge {
       return;
     }
 
-    const questions = await loadQuestions(sessionId);
+    const questions = this.getQuestions(sessionId);
     const active = questions.filter(
       (q) => q.status === "open" || q.status === "pending-delivery",
     );
@@ -319,7 +350,7 @@ export class ClarifierBridge {
       return;
     }
 
-    const questions = await loadQuestions(sessionId);
+    const questions = this.getQuestions(sessionId);
     const toInject = questions.filter(
       (q) => q.status === "pending-delivery" && q.deviated === true,
     );
@@ -353,15 +384,7 @@ export class ClarifierBridge {
       }
     }
 
-    try {
-      await saveQuestions(sessionId, questions);
-    } catch (err) {
-      log.error(`save failed during prompt intercept: ${(err as Error).message}`);
-    }
-
-    void this.publishAttentionFlag(sessionId).catch((err) =>
-      log.error(`publishAttentionFlag after inject failed: ${(err as Error).message}`),
-    );
+    await this.setQuestions(sessionId, questions);
 
     this.client.reply(req.id, { action: "continue", payload: rewrittenEnvelope });
   }
@@ -425,10 +448,10 @@ export class ClarifierBridge {
       return;
     }
 
-    let questions = await loadQuestions(sessionId);
+    let questions = this.getQuestions(sessionId);
     const newQ = newQuestion({ question, defaultAnswer, options });
     questions.push(newQ);
-    await saveQuestions(sessionId, questions);
+    await this.setQuestions(sessionId, questions);
     this.client.reply(reqId, {
       content: [{ type: "text", text: "noted" }],
     });
@@ -437,7 +460,6 @@ export class ClarifierBridge {
     // call itself doesn't need chain membership — it arrived via the HTTP
     // /mcp/hydra-acp-clarifier route — but the answer-back wire path does.
     void this.ensureAttached(sessionId);
-    void this.publishAttentionFlag(sessionId);
     void this.emitQuestionAsked(sessionId, newQ).catch((err) =>
       log.error(`failed to emit question/asked: ${(err as Error).message}`),
     );
@@ -447,7 +469,7 @@ export class ClarifierBridge {
     reqId: number | string,
     sessionId: string,
   ): Promise<void> {
-    const questions = await loadQuestions(sessionId);
+    const questions = this.getQuestions(sessionId);
     const filtered = questions.filter(
       (q) => q.status === "open" || q.status === "pending-delivery",
     );
@@ -472,7 +494,7 @@ export class ClarifierBridge {
       return;
     }
 
-    const questions = await loadQuestions(sessionId);
+    const questions = this.getQuestions(sessionId);
     const idx = questions.findIndex((q) => q.id === id);
     if (idx === -1) {
       this.client.reply(reqId, {
@@ -494,12 +516,11 @@ export class ClarifierBridge {
       status: "closed",
       closureReason: "dismissed",
     };
-    await saveQuestions(sessionId, questions);
+    await this.setQuestions(sessionId, questions);
     this.client.reply(reqId, {
       content: [{ type: "text", text: "dismissed" }],
     });
     void this.ensureAttached(sessionId);
-    void this.publishAttentionFlag(sessionId);
     void this.emitQuestionDismissed(sessionId, id, "agent").catch((err) =>
       log.error(`failed to emit question/dismissed: ${(err as Error).message}`),
     );
@@ -608,26 +629,51 @@ export class ClarifierBridge {
     }
   }
 
-  private async publishAttentionFlag(sessionId: string): Promise<void> {
+  getQuestions(sessionId: string): Question[] {
+    return this.sessionQuestions.get(sessionId) ?? [];
+  }
+
+  async setQuestions(sessionId: string, questions: Question[]): Promise<void> {
+    if (questions.length > 0) {
+      this.sessionQuestions.set(sessionId, questions);
+      await this.client.request("hydra-acp/attention/set", {
+        sessionId,
+        reason: "questions",
+        payload: { kind: "questions", questions },
+      });
+    } else {
+      this.sessionQuestions.delete(sessionId);
+      await this.client.request("hydra-acp/attention/clear", {
+        sessionId,
+        reason: "questions",
+      });
+    }
+  }
+
+  async populateQuestionsCache(): Promise<void> {
     try {
-      const questions = await loadQuestions(sessionId);
-      const active = questions.filter(
-        (q) => q.status === "open" || q.status === "pending-delivery",
-      );
-      if (active.length > 0) {
-        await this.client.request("hydra-acp/attention/set", {
-          sessionId,
-          reason: "questions",
-          payload: { kind: "questions", questions: active },
-        });
-      } else {
-        await this.client.request("hydra-acp/attention/clear", {
-          sessionId,
-          reason: "questions",
-        });
+      const url = `${this.opts.daemonUrl}/v1/sessions/attention?source=hydra-acp-clarifier`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${this.opts.token}` },
+      });
+      if (!res.ok) {
+        log.warn(`populateQuestionsCache: HTTP ${res.status} from ${url}`);
+        return;
       }
+      const body = (await res.json()) as { flags?: unknown[] };
+      const flags = Array.isArray(body.flags) ? body.flags : [];
+      for (const flag of flags) {
+        const flagObj = flag as Record<string, unknown>;
+        const sessionId = typeof flagObj.sessionId === "string" ? flagObj.sessionId : "";
+        const payload = flagObj.payload as Record<string, unknown> | undefined;
+        const questions = Array.isArray(payload?.questions) ? payload.questions as Question[] : [];
+        if (sessionId && questions.length > 0) {
+          this.sessionQuestions.set(sessionId, questions);
+        }
+      }
+      log.info(`populateQuestionsCache: loaded ${this.sessionQuestions.size} session(s)`);
     } catch (err) {
-      log.warn(`publishAttentionFlag failed for ${sessionId}: ${(err as Error).message}`);
+      log.warn(`populateQuestionsCache failed: ${(err as Error).message}`);
     }
   }
 
@@ -643,9 +689,7 @@ export class ClarifierBridge {
     }
     switch (event) {
       case "session.opened":
-        void this.publishAttentionFlag(sessionId).catch((err) =>
-          log.error(`publishAttentionFlag on session.opened failed: ${(err as Error).message}`),
-        );
+        log.debug(`session ${sessionId} opened`);
         break;
       case "session.closed":
         log.debug(`session ${sessionId} closed`);

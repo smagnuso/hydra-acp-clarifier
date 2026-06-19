@@ -33,9 +33,10 @@ Options:
   --help       Show this help.
 
 Environment:
-  HYDRA_ACP_HOME     Hydra data directory (default: ~/.hydra-acp)
-  HYDRA_ACP_WS_URL   Daemon websocket URL (injected by hydra-acp on spawn).
-  HYDRA_ACP_TOKEN    Per-process transformer token (injected by hydra-acp).
+  HYDRA_ACP_HOME         Hydra data directory (default: ~/.hydra-acp)
+  HYDRA_ACP_WS_URL       Daemon websocket URL (injected by hydra-acp on spawn).
+  HYDRA_ACP_DAEMON_URL   Daemon HTTP base URL (injected by hydra-acp on spawn).
+  HYDRA_ACP_TOKEN        Per-process transformer token (injected by hydra-acp).
 `;
 
 async function main(): Promise<void> {
@@ -59,13 +60,18 @@ async function main(): Promise<void> {
     log.error("HYDRA_ACP_WS_URL must be set (injected by hydra-acp on spawn)");
     process.exit(1);
   }
+  const daemonUrl = process.env.HYDRA_ACP_DAEMON_URL;
+  if (!daemonUrl) {
+    log.error("HYDRA_ACP_DAEMON_URL must be set (injected by hydra-acp on spawn)");
+    process.exit(1);
+  }
   const token = process.env.HYDRA_ACP_TOKEN;
   if (!token) {
     log.error("HYDRA_ACP_TOKEN must be set (injected by hydra-acp on spawn)");
     process.exit(1);
   }
 
-  const bridge = new ClarifierBridge({ daemonWsUrl, token });
+  const bridge = new ClarifierBridge({ daemonWsUrl, daemonUrl, token });
   bridge.start();
 
   process.on("SIGTERM", () => {

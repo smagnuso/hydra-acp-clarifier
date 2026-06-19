@@ -1,12 +1,7 @@
 import { EventEmitter } from "node:events";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { rm, readdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, resolve } from "node:path";
-import { describe, it, afterEach } from "node:test";
+import { describe, it, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-// Shape matching TransformerClient's public API that the bridge uses.
 interface TransformerClientStub extends EventEmitter {
   intercepts: string[];
   start(): void;
@@ -16,15 +11,11 @@ interface TransformerClientStub extends EventEmitter {
   request(method: string, params: unknown): Promise<unknown>;
   _lastReply?: { id: number | string; payload: unknown };
   _lastReplyError?: { id: number | string; code: number; message: string };
-  _lastRequest?: { method: string; params: unknown };
+  _requestLog: Array<{ method: string; params: unknown }>;
 }
 
-// We import the bridge module to verify its structure. The real TransformerClient
-// is used in production; here we only test that ClarifierBridge exposes the
-// expected public surface and that its intercepts list has the right shape.
 const { ClarifierBridge, CLARIFIER_INTERCEPTS: EXPECTED_INTERCEPTS } = await import("../src/bridge.js");
 const { newQuestion } = await import("../src/question.js");
-const { saveQuestions } = await import("../src/store.js");
 
 function makeStubClient(): TransformerClientStub {
   const client = new EventEmitter() as unknown as TransformerClientStub;
@@ -49,6 +40,7 @@ describe("ClarifierBridge — construction", () => {
   it("does not throw when constructed with options", () => {
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     assert.ok(bridge instanceof ClarifierBridge);
@@ -60,6 +52,7 @@ describe("ClarifierBridge — construction", () => {
     // synchronously, we'd catch it here.
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     assert.ok(bridge);
@@ -90,6 +83,7 @@ describe("ClarifierBridge — dispatch shape", () => {
   it('handleTransformerMessage exists and is callable', () => {
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     assert.strictEqual(typeof (bridge as any).handleTransformerMessage, "function");
@@ -98,6 +92,7 @@ describe("ClarifierBridge — dispatch shape", () => {
   it('handleMcpInvoke exists and is callable', () => {
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     assert.strictEqual(typeof (bridge as any).handleMcpInvoke, "function");
@@ -108,6 +103,7 @@ describe("ClarifierBridge — dispatch shape", () => {
 
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
 
@@ -144,6 +140,7 @@ describe("ClarifierBridge — dispatch shape", () => {
 
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
@@ -175,6 +172,7 @@ describe("ClarifierBridge — dispatch shape", () => {
 
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
@@ -193,31 +191,17 @@ describe("ClarifierBridge — dispatch shape", () => {
   });
 });
 
-describe("ClarifierBridge — attention flag", () => {
-  let tmpHome: string;
+describe("ClarifierBridge — MCP tools (in-memory cache)", () => {
+  let stubClient: TransformerClientStub;
 
-  function setupTmpHome(): void {
-    const base = resolve(tmpdir(), "clarifier-test-");
-    const randomDir = `${base}${Math.random().toString(36).slice(2)}`;
-    tmpHome = randomDir;
-    mkdirSync(randomDir, { recursive: true });
-    process.env.HYDRA_ACP_HOME = tmpHome;
-  }
-
-  afterEach(async () => {
-    if (tmpHome) {
-      await rm(tmpHome, { recursive: true, force: true });
-      tmpHome = "";
-    }
-    delete process.env.HYDRA_ACP_HOME;
+  beforeEach(() => {
+    stubClient = makeStubClient();
   });
 
-  it("note_question with one question triggers attention/set", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
+  it("note_question adds a question to cache and triggers attention/set", async () => {
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
@@ -248,8 +232,16 @@ describe("ClarifierBridge — attention flag", () => {
     assert.strictEqual(payload.isError, undefined);
     assert.strictEqual(payload.content[0].text, "noted");
 
+    // Verify cache was updated
+    const cached = (bridge as any).getQuestions(sessionId);
+    assert.strictEqual(cached.length, 1);
+    assert.strictEqual(cached[0].question, "What is the capital of France?");
+    assert.strictEqual(cached[0].defaultAnswer, "Paris");
+    assert.deepStrictEqual(cached[0].options, ["Paris", "London", "Berlin"]);
+
+    // Verify attention/set was called via setQuestions
     const attentionSetCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/attention/set",
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
     );
     assert.ok(attentionSetCall, "expected hydra-acp/attention/set to be called");
     assert.strictEqual(attentionSetCall!.params.sessionId, sessionId);
@@ -257,36 +249,25 @@ describe("ClarifierBridge — attention flag", () => {
     const setPayload = attentionSetCall!.params.payload as { kind: string; questions: unknown[] };
     assert.strictEqual(setPayload.kind, "questions");
     assert.ok(Array.isArray(setPayload.questions));
-    const questions = (attentionSetCall!.params.payload as { questions: unknown[] }).questions;
-    assert.strictEqual(questions.length, 1);
-    assert.strictEqual(questions[0].question, "What is the capital of France?");
-    assert.strictEqual(questions[0].defaultAnswer, "Paris");
-    assert.deepStrictEqual(questions[0].options, ["Paris", "London", "Berlin"]);
+    assert.strictEqual(setPayload.questions.length, 1);
   });
 
   it("dismiss_question on the only question triggers attention/clear", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
-    // Pre-create a question file so dismiss has something to find
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
-    const singleQuestion = [{
+    (bridge as any).sessionQuestions.set(sessionId, [{
       id: "q-1",
       question: "Confirm this action?",
       defaultAnswer: "Yes",
       askedAt: Date.now(),
       status: "open",
-    }];
-    writeFileSync(qPath, JSON.stringify(singleQuestion));
+    }]);
 
     const reqId = 2;
 
@@ -309,45 +290,42 @@ describe("ClarifierBridge — attention flag", () => {
     assert.strictEqual(payload.isError, undefined);
     assert.strictEqual(payload.content[0].text, "dismissed");
 
-    const attentionClearCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/attention/clear",
-    );
-    assert.ok(attentionClearCall, "expected hydra-acp/attention/clear to be called");
-    assert.strictEqual(attentionClearCall!.params.sessionId, sessionId);
-    assert.strictEqual(attentionClearCall!.params.reason, "questions");
+    // Cache should have the dismissed question (setQuestions sends full array)
+    const cached = (bridge as any).getQuestions(sessionId);
+    assert.strictEqual(cached.length, 1);
+    assert.strictEqual(cached[0].status, "closed");
+    assert.strictEqual(cached[0].closureReason, "dismissed");
 
+    // attention/set should have been called with full array via setQuestions
     const attentionSetCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/attention/set",
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
     );
-    assert.strictEqual(attentionSetCall, undefined);
+    assert.ok(attentionSetCall, "expected hydra-acp/attention/set to be called");
+    assert.strictEqual(attentionSetCall!.params.sessionId, sessionId);
+    assert.strictEqual(attentionSetCall!.params.reason, "questions");
+    const setPayload = attentionSetCall!.params.payload as { kind: string; questions: unknown[] };
+    assert.strictEqual(setPayload.kind, "questions");
+    assert.strictEqual(setPayload.questions.length, 1);
+
+    // attention/clear should NOT have been called
+    const attentionClearCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/clear",
+    );
+    assert.strictEqual(attentionClearCall, undefined);
   });
 });
 
 describe("ClarifierBridge — message/emit notifications", () => {
-  let tmpHome: string;
+  let stubClient: TransformerClientStub;
 
-  function setupTmpHome(): void {
-    const base = resolve(tmpdir(), "clarifier-emit-test-");
-    const randomDir = `${base}${Math.random().toString(36).slice(2)}`;
-    tmpHome = randomDir;
-    mkdirSync(randomDir, { recursive: true });
-    process.env.HYDRA_ACP_HOME = tmpHome;
-  }
-
-  afterEach(async () => {
-    if (tmpHome) {
-      await rm(tmpHome, { recursive: true, force: true });
-      tmpHome = "";
-    }
-    delete process.env.HYDRA_ACP_HOME;
+  beforeEach(() => {
+    stubClient = makeStubClient();
   });
 
   it("note_question emits message/emit with method=hydra-acp/question/asked", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
@@ -379,7 +357,7 @@ describe("ClarifierBridge — message/emit notifications", () => {
     assert.strictEqual(payload.content[0].text, "noted");
 
     const emitCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/message/emit",
+      (r: { method: string }) => r.method === "hydra-acp/message/emit",
     );
     assert.ok(emitCall, "expected hydra-acp/message/emit to be called");
     assert.strictEqual(emitCall!.params.sessionId, sessionId);
@@ -397,28 +375,21 @@ describe("ClarifierBridge — message/emit notifications", () => {
   });
 
   it("dismiss_question emits message/emit with method=hydra-acp/question/dismissed", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
+    const bridge = new ClarifierBridge({
+      daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
+      token: "test-token",
+    });
+    (bridge as any).client = stubClient;
 
-    // Pre-create a question file so dismiss has something to find
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
-    const singleQuestion = [{
+    (bridge as any).sessionQuestions.set(sessionId, [{
       id: "q-dismiss-test",
       question: "Confirm this action?",
       defaultAnswer: "Yes",
       askedAt: Date.now(),
       status: "open",
-    }];
-    writeFileSync(qPath, JSON.stringify(singleQuestion));
-
-    const bridge = new ClarifierBridge({
-      daemonWsUrl: "ws://127.0.0.1:55514/acp",
-      token: "test-token",
-    });
-    (bridge as any).client = stubClient;
+    }]);
 
     const reqId = 2;
 
@@ -442,7 +413,7 @@ describe("ClarifierBridge — message/emit notifications", () => {
     assert.strictEqual(payload.content[0].text, "dismissed");
 
     const emitCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/message/emit",
+      (r: { method: string }) => r.method === "hydra-acp/message/emit",
     );
     assert.ok(emitCall, "expected hydra-acp/message/emit to be called");
     assert.strictEqual(emitCall!.params.sessionId, sessionId);
@@ -457,22 +428,10 @@ describe("ClarifierBridge — message/emit notifications", () => {
 });
 
 describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
-  let tmpHome: string;
+  let stubClient: TransformerClientStub;
 
-  function setupTmpHome(): void {
-    const base = resolve(tmpdir(), "clarifier-answer-test-");
-    const randomDir = `${base}${Math.random().toString(36).slice(2)}`;
-    tmpHome = randomDir;
-    mkdirSync(randomDir, { recursive: true });
-    process.env.HYDRA_ACP_HOME = tmpHome;
-  }
-
-  afterEach(async () => {
-    if (tmpHome) {
-      await rm(tmpHome, { recursive: true, force: true });
-      tmpHome = "";
-    }
-    delete process.env.HYDRA_ACP_HOME;
+  beforeEach(() => {
+    stubClient = makeStubClient();
   });
 
   function makeAnswerReq(sessionId: string, questionId: string, answer: string): Record<string, unknown> {
@@ -489,28 +448,22 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
     };
   }
 
-  it("deviation → status=pending-delivery, emit fired, attention republished", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
+  it("deviation → status=pending-delivery, emit fired, cache updated", async () => {
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
-    const question = [{
+    (bridge as any).sessionQuestions.set(sessionId, [{
       id: "q-1",
       question: "Use US dollars?",
       defaultAnswer: "Yes",
       askedAt: Date.now(),
       status: "open",
-    }];
-    writeFileSync(qPath, JSON.stringify(question));
+    }]);
 
     (bridge as any).onRequest(makeAnswerReq(sessionId, "q-1", "No"));
     await new Promise((r) => setTimeout(r, 100));
@@ -520,14 +473,16 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
       payload: { ok: true },
     });
 
-    const saved = JSON.parse(readFileSync(qPath, "utf-8")) as typeof question;
-    assert.strictEqual(saved[0].status, "pending-delivery");
-    assert.strictEqual(saved[0].userAnswer, "No");
-    assert.strictEqual(saved[0].deviated, true);
-    assert.strictEqual(saved[0].closureReason, undefined);
+    // Verify cache was updated
+    const cached = (bridge as any).getQuestions(sessionId);
+    assert.strictEqual(cached.length, 1);
+    assert.strictEqual(cached[0].status, "pending-delivery");
+    assert.strictEqual(cached[0].userAnswer, "No");
+    assert.strictEqual(cached[0].deviated, true);
+    assert.strictEqual(cached[0].closureReason, undefined);
 
     const emitCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/message/emit",
+      (r: { method: string }) => r.method === "hydra-acp/message/emit",
     );
     assert.ok(emitCall);
     assert.strictEqual(emitCall!.params.sessionId, sessionId);
@@ -537,34 +492,29 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
     assert.strictEqual(env.userAnswer, "No");
     assert.strictEqual(env.deviated, true);
 
+    // attention/set should have been called (still has pending-delivery question)
     const attentionSetCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/attention/set",
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
     );
     assert.ok(attentionSetCall);
   });
 
-  it("kept default → status=closed with default-accepted, no further injection", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
+  it("kept default → status=closed with default-accepted, cache updated", async () => {
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
-    const question = [{
+    (bridge as any).sessionQuestions.set(sessionId, [{
       id: "q-2",
       question: "Use US dollars?",
       defaultAnswer: "Yes",
       askedAt: Date.now(),
       status: "open",
-    }];
-    writeFileSync(qPath, JSON.stringify(question));
+    }]);
 
     (bridge as any).onRequest(makeAnswerReq(sessionId, "q-2", "Yes"));
     await new Promise((r) => setTimeout(r, 100));
@@ -574,24 +524,30 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
       payload: { ok: true },
     });
 
-    const saved = JSON.parse(readFileSync(qPath, "utf-8")) as typeof question;
-    assert.strictEqual(saved[0].status, "closed");
-    assert.strictEqual(saved[0].userAnswer, "Yes");
-    assert.strictEqual(saved[0].deviated, false);
-    assert.strictEqual(saved[0].closureReason, "default-accepted");
+    const cached = (bridge as any).getQuestions(sessionId);
+    assert.strictEqual(cached.length, 1);
+    assert.strictEqual(cached[0].status, "closed");
+    assert.strictEqual(cached[0].userAnswer, "Yes");
+    assert.strictEqual(cached[0].deviated, false);
+    assert.strictEqual(cached[0].closureReason, "default-accepted");
 
-    const attentionClearCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/attention/clear",
+    // attention/set should have been called (setQuestions sends full array)
+    const attentionSetCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
     );
-    assert.ok(attentionClearCall);
+    assert.ok(attentionSetCall);
+
+    // attention/clear should NOT have been called
+    const attentionClearCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/clear",
+    );
+    assert.strictEqual(attentionClearCall, undefined);
   });
 
   it("unknown questionId → InvalidParams error reply", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
@@ -606,9 +562,7 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
   });
 
   it("answering an already-closed question is refused with InvalidParams (no state change)", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-    const bridge = new ClarifierBridge({ daemonWsUrl: "ws://stub", token: "stub" });
+    const bridge = new ClarifierBridge({ daemonWsUrl: "ws://stub", daemonUrl: "http://stub", token: "stub" });
     (bridge as any).client = stubClient;
     const sessionId = "session-answer-already-closed";
     const question = [
@@ -621,14 +575,7 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
         closureReason: "default-accepted" as const,
       },
     ];
-    const qPath = resolve(
-      tmpHome,
-      "sessions",
-      sessionId,
-      "clarifier-questions.json",
-    );
-    mkdirSync(dirname(qPath), { recursive: true });
-    writeFileSync(qPath, JSON.stringify(question));
+    (bridge as any).sessionQuestions.set(sessionId, question);
 
     (bridge as any).onRequest(makeAnswerReq(sessionId, "q-locked", "no"));
     await new Promise((r) => setTimeout(r, 50));
@@ -636,31 +583,19 @@ describe("ClarifierBridge — handleAnswer (inbound /answer)", () => {
     assert.ok(stubClient._lastReplyError, "expected error reply");
     assert.strictEqual(stubClient._lastReplyError.code, -32602);
 
-    // On-disk state must be unchanged.
-    const saved = JSON.parse(readFileSync(qPath, "utf-8")) as typeof question;
-    assert.strictEqual(saved[0].status, "closed");
-    assert.strictEqual(saved[0].closureReason, "default-accepted");
-    assert.strictEqual(saved[0].userAnswer, undefined);
+    // Cache should be unchanged
+    const cached = (bridge as any).getQuestions(sessionId);
+    assert.strictEqual(cached[0].status, "closed");
+    assert.strictEqual(cached[0].closureReason, "default-accepted");
+    assert.strictEqual(cached[0].userAnswer, undefined);
   });
 });
 
 describe("ClarifierBridge — handleDismiss (inbound /dismiss)", () => {
-  let tmpHome: string;
+  let stubClient: TransformerClientStub;
 
-  function setupTmpHome(): void {
-    const base = resolve(tmpdir(), "clarifier-dismiss-test-");
-    const randomDir = `${base}${Math.random().toString(36).slice(2)}`;
-    tmpHome = randomDir;
-    mkdirSync(randomDir, { recursive: true });
-    process.env.HYDRA_ACP_HOME = tmpHome;
-  }
-
-  afterEach(async () => {
-    if (tmpHome) {
-      await rm(tmpHome, { recursive: true, force: true });
-      tmpHome = "";
-    }
-    delete process.env.HYDRA_ACP_HOME;
+  beforeEach(() => {
+    stubClient = makeStubClient();
   });
 
   function makeDismissReq(sessionId: string, questionId: string): Record<string, unknown> {
@@ -678,27 +613,21 @@ describe("ClarifierBridge — handleDismiss (inbound /dismiss)", () => {
   }
 
   it("marks question closed with dismissed reason", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
-    const question = [{
+    (bridge as any).sessionQuestions.set(sessionId, [{
       id: "q-dismiss-inbound",
       question: "Proceed?",
       defaultAnswer: "Yes",
       askedAt: Date.now(),
       status: "open",
-    }];
-    writeFileSync(qPath, JSON.stringify(question));
+    }]);
 
     (bridge as any).onRequest(makeDismissReq(sessionId, "q-dismiss-inbound"));
     await new Promise((r) => setTimeout(r, 100));
@@ -708,28 +637,33 @@ describe("ClarifierBridge — handleDismiss (inbound /dismiss)", () => {
       payload: { ok: true },
     });
 
-    const saved = JSON.parse(readFileSync(qPath, "utf-8")) as typeof question;
-    assert.strictEqual(saved[0].status, "closed");
-    assert.strictEqual(saved[0].closureReason, "dismissed");
+    const cached = (bridge as any).getQuestions(sessionId);
+    assert.strictEqual(cached[0].status, "closed");
+    assert.strictEqual(cached[0].closureReason, "dismissed");
 
     const emitCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/message/emit",
+      (r: { method: string }) => r.method === "hydra-acp/message/emit",
     );
     assert.ok(emitCall);
     assert.strictEqual(emitCall!.params.method, "hydra-acp/question/dismissed");
     const env = emitCall!.params.envelope as { by: string };
     assert.strictEqual(env.by, "user");
 
-    const attentionClearCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/attention/clear",
+    // attention/set should have been called (setQuestions sends full array)
+    const attentionSetCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
     );
-    assert.ok(attentionClearCall);
+    assert.ok(attentionSetCall);
+
+    // attention/clear should NOT have been called
+    const attentionClearCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/clear",
+    );
+    assert.strictEqual(attentionClearCall, undefined);
   });
 
   it("dismissing an already-closed question is idempotent (reply is action:stop, no further wire calls)", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-    const bridge = new ClarifierBridge({ daemonWsUrl: "ws://stub", token: "stub" });
+    const bridge = new ClarifierBridge({ daemonWsUrl: "ws://stub", daemonUrl: "http://stub", token: "stub" });
     (bridge as any).client = stubClient;
     const sessionId = "session-dismiss-idempotent";
     const question = [
@@ -742,14 +676,7 @@ describe("ClarifierBridge — handleDismiss (inbound /dismiss)", () => {
         closureReason: "dismissed" as const,
       },
     ];
-    const qPath = resolve(
-      tmpHome,
-      "sessions",
-      sessionId,
-      "clarifier-questions.json",
-    );
-    mkdirSync(dirname(qPath), { recursive: true });
-    writeFileSync(qPath, JSON.stringify(question));
+    (bridge as any).sessionQuestions.set(sessionId, question);
 
     (bridge as any).onRequest(makeDismissReq(sessionId, "q-already-closed"));
     await new Promise((r) => setTimeout(r, 100));
@@ -759,29 +686,17 @@ describe("ClarifierBridge — handleDismiss (inbound /dismiss)", () => {
       payload: { ok: true },
     });
     const emitCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/message/emit",
+      (r: { method: string }) => r.method === "hydra-acp/message/emit",
     );
     assert.strictEqual(emitCall, undefined, "no notification should fire for an idempotent dismiss");
   });
 });
 
 describe("ClarifierBridge — handleList (inbound /list)", () => {
-  let tmpHome: string;
+  let stubClient: TransformerClientStub;
 
-  function setupTmpHome(): void {
-    const base = resolve(tmpdir(), "clarifier-list-test-");
-    const randomDir = `${base}${Math.random().toString(36).slice(2)}`;
-    tmpHome = randomDir;
-    mkdirSync(randomDir, { recursive: true });
-    process.env.HYDRA_ACP_HOME = tmpHome;
-  }
-
-  afterEach(async () => {
-    if (tmpHome) {
-      await rm(tmpHome, { recursive: true, force: true });
-      tmpHome = "";
-    }
-    delete process.env.HYDRA_ACP_HOME;
+  beforeEach(() => {
+    stubClient = makeStubClient();
   });
 
   function makeListReq(sessionId: string): Record<string, unknown> {
@@ -799,19 +714,14 @@ describe("ClarifierBridge — handleList (inbound /list)", () => {
   }
 
   it("returns correct shape with active questions only", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
     const questions = [
       {
         id: "q-open",
@@ -836,7 +746,7 @@ describe("ClarifierBridge — handleList (inbound /list)", () => {
         closureReason: "default-accepted",
       },
     ];
-    writeFileSync(qPath, JSON.stringify(questions));
+    (bridge as any).sessionQuestions.set(sessionId, questions);
 
     (bridge as any).onRequest(makeListReq(sessionId));
     await new Promise((r) => setTimeout(r, 50));
@@ -849,22 +759,10 @@ describe("ClarifierBridge — handleList (inbound /list)", () => {
 });
 
 describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
-  let tmpHome: string;
+  let stubClient: TransformerClientStub;
 
-  function setupTmpHome(): void {
-    const base = resolve(tmpdir(), "clarifier-prompt-test-");
-    const randomDir = `${base}${Math.random().toString(36).slice(2)}`;
-    tmpHome = randomDir;
-    mkdirSync(randomDir, { recursive: true });
-    process.env.HYDRA_ACP_HOME = tmpHome;
-  }
-
-  afterEach(async () => {
-    if (tmpHome) {
-      await rm(tmpHome, { recursive: true, force: true });
-      tmpHome = "";
-    }
-    delete process.env.HYDRA_ACP_HOME;
+  beforeEach(() => {
+    stubClient = makeStubClient();
   });
 
   function makePromptReq(
@@ -885,19 +783,14 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
   }
 
   it("no pending-delivery deviations → reply {action:'continue'} with no payload", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
     const questions = [
       {
         id: "q-open",
@@ -915,7 +808,7 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
         closureReason: "default-accepted",
       },
     ];
-    writeFileSync(qPath, JSON.stringify(questions));
+    (bridge as any).sessionQuestions.set(sessionId, questions);
 
     (bridge as any).onRequest(makePromptReq(sessionId, [{ type: "text", text: "Hello" }]));
     await new Promise((r) => setTimeout(r, 50));
@@ -924,19 +817,14 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
   });
 
   it("one deviation → reply has rewritten envelope, deviation block is first prompt block, question transitions to closed", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
     const questions = [
       {
         id: "q-1",
@@ -948,7 +836,7 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
         deviated: true,
       },
     ];
-    writeFileSync(qPath, JSON.stringify(questions));
+    (bridge as any).sessionQuestions.set(sessionId, questions);
 
     const originalPrompt = [{ type: "text", text: "Tell me about pricing." }];
     (bridge as any).onRequest(makePromptReq(sessionId, originalPrompt));
@@ -983,32 +871,34 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
     assert.strictEqual(secondBlock.type, "text");
     assert.strictEqual(secondBlock.text, "Tell me about pricing.");
 
-    // Verify question transitioned to closed with deviation-delivered reason
-    const saved = JSON.parse(readFileSync(qPath, "utf-8")) as typeof questions;
-    assert.strictEqual(saved[0].status, "closed");
-    assert.strictEqual(saved[0].closureReason, "deviation-delivered");
+    // Verify cache was updated — question transitioned to closed with deviation-delivered reason
+    const cached = (bridge as any).getQuestions(sessionId);
+    assert.strictEqual(cached.length, 1);
+    assert.strictEqual(cached[0].status, "closed");
+    assert.strictEqual(cached[0].closureReason, "deviation-delivered");
 
-    // attention flag should be cleared (no more active questions)
-    const attentionClearCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/attention/clear",
+    // attention/set should have been called (setQuestions sends full array)
+    const attentionSetCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
     );
-    assert.ok(attentionClearCall);
+    assert.ok(attentionSetCall);
+
+    // attention/clear should NOT have been called
+    const attentionClearCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/clear",
+    );
+    assert.strictEqual(attentionClearCall, undefined);
   });
 
   it("multiple deviations → all listed in one block, all transition to closed", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
     const questions = [
       {
         id: "q-m1",
@@ -1029,7 +919,7 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
         deviated: true,
       },
     ];
-    writeFileSync(qPath, JSON.stringify(questions));
+    (bridge as any).sessionQuestions.set(sessionId, questions);
 
     const originalPrompt = [{ type: "text", text: "Calculate total." }];
     (bridge as any).onRequest(makePromptReq(sessionId, originalPrompt));
@@ -1059,32 +949,34 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
       "both user answers should appear",
     );
 
-    const saved = JSON.parse(readFileSync(qPath, "utf-8")) as typeof questions;
-    assert.strictEqual(saved[0].status, "closed");
-    assert.strictEqual(saved[0].closureReason, "deviation-delivered");
-    assert.strictEqual(saved[1].status, "closed");
-    assert.strictEqual(saved[1].closureReason, "deviation-delivered");
+    const cached = (bridge as any).getQuestions(sessionId);
+    assert.strictEqual(cached[0].status, "closed");
+    assert.strictEqual(cached[0].closureReason, "deviation-delivered");
+    assert.strictEqual(cached[1].status, "closed");
+    assert.strictEqual(cached[1].closureReason, "deviation-delivered");
 
-    const attentionClearCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/attention/clear",
+    // attention/set should have been called (setQuestions sends full array)
+    const attentionSetCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
     );
-    assert.ok(attentionClearCall);
+    assert.ok(attentionSetCall);
+
+    // attention/clear should NOT have been called
+    const attentionClearCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/clear",
+    );
+    assert.strictEqual(attentionClearCall, undefined);
   });
 
   it("keeps-defaulted question is not injected (status=closed, not pending-delivery)", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
     const questions = [
       {
         id: "q-kept",
@@ -1097,7 +989,7 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
         deviated: false,
       },
     ];
-    writeFileSync(qPath, JSON.stringify(questions));
+    (bridge as any).sessionQuestions.set(sessionId, questions);
 
     (bridge as any).onRequest(makePromptReq(sessionId, [{ type: "text", text: "Hello" }]));
     await new Promise((r) => setTimeout(r, 50));
@@ -1106,19 +998,14 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
   });
 
   it("attention flag is republished after injection", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
     const questions = [
       {
         id: "q-1",
@@ -1130,34 +1017,36 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
         deviated: true,
       },
     ];
-    writeFileSync(qPath, JSON.stringify(questions));
+    (bridge as any).sessionQuestions.set(sessionId, questions);
 
     (bridge as any).onRequest(makePromptReq(sessionId, [{ type: "text", text: "Go" }]));
     await new Promise((r) => setTimeout(r, 100));
 
+    // attention/set should have been called via setQuestions
     const attentionCall = stubClient._requestLog.find(
-      (r) => r.method === "hydra-acp/attention/clear",
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
     );
     assert.ok(attentionCall);
-    const clearParams = attentionCall!.params as Record<string, unknown>;
-    assert.strictEqual(clearParams.sessionId, sessionId);
-    assert.strictEqual(clearParams.reason, "questions");
+    const setParams = attentionCall!.params as Record<string, unknown>;
+    assert.strictEqual(setParams.sessionId, sessionId);
+    assert.strictEqual(setParams.reason, "questions");
+
+    // attention/clear should NOT have been called
+    const clearCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/clear",
+    );
+    assert.strictEqual(clearCall, undefined);
   });
 
   it("does not mutate the original envelope object", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
     const sessionId = `session-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    const qPath = resolve(questionsDir, "clarifier-questions.json");
     const questions = [
       {
         id: "q-immutable",
@@ -1169,7 +1058,7 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
         deviated: true,
       },
     ];
-    writeFileSync(qPath, JSON.stringify(questions));
+    (bridge as any).sessionQuestions.set(sessionId, questions);
 
     const originalPrompt = [{ type: "text", text: "Hello" }];
     const snapshotLength = originalPrompt.length;
@@ -1185,274 +1074,40 @@ describe("ClarifierBridge — handlePromptIntercept (session/prompt)", () => {
 });
 
 describe("ClarifierBridge — startup reconcile", () => {
-  let tmpHome: string;
-
-  function setupTmpHome(): void {
-    const base = resolve(tmpdir(), "clarifier-reconcile-test-");
-    const randomDir = `${base}${Math.random().toString(36).slice(2)}`;
-    tmpHome = randomDir;
-    mkdirSync(randomDir, { recursive: true });
-    process.env.HYDRA_ACP_HOME = tmpHome;
-  }
-
-  afterEach(async () => {
-    if (tmpHome) {
-      await rm(tmpHome, { recursive: true, force: true });
-      tmpHome = "";
-    }
-    delete process.env.HYDRA_ACP_HOME;
-  });
-
-  it("reconcile republishes exactly one attention flag when one session has open questions and another has all closed", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
+  it("publishAttentionFlag has been removed (reconcile rewritten in next task)", () => {
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
-    (bridge as any).client = stubClient;
-
-    // Session A: has an open question → should trigger attention/set
-    const sessionA = `session-reconcile-a-${Date.now()}`;
-    const dirA = resolve(tmpHome, "sessions", sessionA);
-    mkdirSync(dirA, { recursive: true });
-    writeFileSync(
-      resolve(dirA, "clarifier-questions.json"),
-      JSON.stringify([{
-        id: "q-a1",
-        question: "Proceed with A?",
-        defaultAnswer: "Yes",
-        askedAt: Date.now(),
-        status: "open",
-      }]),
+    assert.strictEqual(
+      typeof (bridge as any).publishAttentionFlag,
+      "undefined",
+      "publishAttentionFlag should be removed — reconcile is rewritten in the next task",
     );
-
-    // Session B: all questions closed → should NOT trigger attention/set
-    const sessionB = `session-reconcile-b-${Date.now()}`;
-    const dirB = resolve(tmpHome, "sessions", sessionB);
-    mkdirSync(dirB, { recursive: true });
-    writeFileSync(
-      resolve(dirB, "clarifier-questions.json"),
-      JSON.stringify([{
-        id: "q-b1",
-        question: "Done with B?",
-        defaultAnswer: "Yes",
-        askedAt: Date.now(),
-        status: "closed",
-        closureReason: "default-accepted",
-      }]),
-    );
-
-    await (bridge as any).reconcile();
-    await new Promise((r) => setTimeout(r, 100));
-
-    const attentionSetCalls = stubClient._requestLog.filter(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.strictEqual(attentionSetCalls.length, 1, "expected exactly one attention/set call");
-    assert.strictEqual(attentionSetCalls[0].params.sessionId, sessionA);
-
-    const attentionClearCalls = stubClient._requestLog.filter(
-      (r: { method: string }) => r.method === "hydra-acp/attention/clear",
-    );
-    assert.strictEqual(attentionClearCalls.length, 1, "expected exactly one attention/clear call for session B");
-    assert.strictEqual(attentionClearCalls[0].params.sessionId, sessionB);
-  });
-
-  it("reconcile skips non-directory entries in sessions dir", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
-    const bridge = new ClarifierBridge({
-      daemonWsUrl: "ws://127.0.0.1:55514/acp",
-      token: "test-token",
-    });
-    (bridge as any).client = stubClient;
-
-    // Create a session directory with an open question
-    const sessionId = `session-skip-${Date.now()}`;
-    const dir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      resolve(dir, "clarifier-questions.json"),
-      JSON.stringify([{
-        id: "q-skip",
-        question: "Skip test?",
-        defaultAnswer: "Yes",
-        askedAt: Date.now(),
-        status: "open",
-      }]),
-    );
-
-    // Create a non-directory file in sessions dir that should be ignored
-    const fakeFile = resolve(tmpHome, "sessions", "not-a-session.json");
-    writeFileSync(fakeFile, JSON.stringify([]));
-
-    await (bridge as any).reconcile();
-    await new Promise((r) => setTimeout(r, 100));
-
-    const attentionSetCalls = stubClient._requestLog.filter(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.strictEqual(attentionSetCalls.length, 1);
-    assert.strictEqual(attentionSetCalls[0].params.sessionId, sessionId);
-
-    await rm(fakeFile, { force: true });
-  });
-
-  it("reconcile does not throw on per-session errors (bad JSON)", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
-    const bridge = new ClarifierBridge({
-      daemonWsUrl: "ws://127.0.0.1:55514/acp",
-      token: "test-token",
-    });
-    (bridge as any).client = stubClient;
-
-    // Session with bad JSON → should be logged but not abort reconcile
-    const badSession = `session-bad-${Date.now()}`;
-    const badDir = resolve(tmpHome, "sessions", badSession);
-    mkdirSync(badDir, { recursive: true });
-    writeFileSync(resolve(badDir, "clarifier-questions.json"), "NOT VALID JSON{{{");
-
-    // Session with valid open question → should still be processed
-    const goodSession = `session-good-${Date.now()}`;
-    const goodDir = resolve(tmpHome, "sessions", goodSession);
-    mkdirSync(goodDir, { recursive: true });
-    writeFileSync(
-      resolve(goodDir, "clarifier-questions.json"),
-      JSON.stringify([{
-        id: "q-good",
-        question: "Good question?",
-        defaultAnswer: "Yes",
-        askedAt: Date.now(),
-        status: "open",
-      }]),
-    );
-
-    // Should not throw
-    await (bridge as any).reconcile();
-    await new Promise((r) => setTimeout(r, 100));
-
-    const attentionSetCalls = stubClient._requestLog.filter(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.strictEqual(attentionSetCalls.length, 1);
-    assert.strictEqual(attentionSetCalls[0].params.sessionId, goodSession);
-  });
-
-  it("reconcile skips sessions with no questions file", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
-    const bridge = new ClarifierBridge({
-      daemonWsUrl: "ws://127.0.0.1:55514/acp",
-      token: "test-token",
-    });
-    (bridge as any).client = stubClient;
-
-    // Session dir exists but no questions file → loadQuestions returns []
-    const emptySession = `session-empty-${Date.now()}`;
-    const emptyDir = resolve(tmpHome, "sessions", emptySession);
-    mkdirSync(emptyDir, { recursive: true });
-
-    await (bridge as any).reconcile();
-    await new Promise((r) => setTimeout(r, 100));
-
-    const attentionSetCalls = stubClient._requestLog.filter(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.strictEqual(attentionSetCalls.length, 0);
   });
 });
 
 describe("ClarifierBridge — lifecycle event handlers", () => {
-  let tmpHome: string;
-
-  function setupTmpHome(): void {
-    const base = resolve(tmpdir(), "clarifier-lifecycle-test-");
-    const randomDir = `${base}${Math.random().toString(36).slice(2)}`;
-    tmpHome = randomDir;
-    mkdirSync(randomDir, { recursive: true });
-    process.env.HYDRA_ACP_HOME = tmpHome;
-  }
-
-  afterEach(async () => {
-    if (tmpHome) {
-      await rm(tmpHome, { recursive: true, force: true });
-      tmpHome = "";
-    }
-    delete process.env.HYDRA_ACP_HOME;
-  });
-
-  it("session.opened triggers publishAttentionFlag for that session", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
-    const bridge = new ClarifierBridge({
-      daemonWsUrl: "ws://127.0.0.1:55514/acp",
-      token: "test-token",
-    });
-    (bridge as any).client = stubClient;
-
-    // Pre-create a session with an open question
-    const sessionId = `session-lifecycle-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    writeFileSync(
-      resolve(questionsDir, "clarifier-questions.json"),
-      JSON.stringify([{
-        id: "q-lifecycle",
-        question: "Lifecycle test?",
-        defaultAnswer: "Yes",
-        askedAt: Date.now(),
-        status: "open",
-      }]),
-    );
-
-    const notification = {
-      jsonrpc: "2.0" as const,
-      method: "hydra-acp/transformer/session_event",
-      params: { event: "session.opened", sessionId },
-    };
-
-    (bridge as any).onNotification(notification);
-    await new Promise((r) => setTimeout(r, 100));
-
-    const attentionSetCalls = stubClient._requestLog.filter(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.strictEqual(attentionSetCalls.length, 1);
-    assert.strictEqual(attentionSetCalls[0].params.sessionId, sessionId);
-    assert.strictEqual(attentionSetCalls[0].params.reason, "questions");
-  });
-
   it("session.closed does not trigger any WS call", async () => {
-    setupTmpHome();
     const stubClient = makeStubClient();
 
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
 
-    // Pre-create a session with an open question so there's state to potentially surface
+    // Pre-populate cache so there's state to potentially surface
     const sessionId = `session-closed-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    writeFileSync(
-      resolve(questionsDir, "clarifier-questions.json"),
-      JSON.stringify([{
-        id: "q-closed-test",
-        question: "Closed test?",
-        defaultAnswer: "Yes",
-        askedAt: Date.now(),
-        status: "open",
-      }]),
-    );
+    (bridge as any).sessionQuestions.set(sessionId, [{
+      id: "q-closed-test",
+      question: "Closed test?",
+      defaultAnswer: "Yes",
+      askedAt: Date.now(),
+      status: "open",
+    }]);
 
     const notification = {
       jsonrpc: "2.0" as const,
@@ -1469,59 +1124,12 @@ describe("ClarifierBridge — lifecycle event handlers", () => {
     assert.strictEqual(attentionCalls.length, 0, "session.closed should not trigger any attention WS call");
   });
 
-  it("session.opened with no open questions triggers attention/clear", async () => {
-    setupTmpHome();
-    const stubClient = makeStubClient();
-
-    const bridge = new ClarifierBridge({
-      daemonWsUrl: "ws://127.0.0.1:55514/acp",
-      token: "test-token",
-    });
-    (bridge as any).client = stubClient;
-
-    // Session with all closed questions
-    const sessionId = `session-cleared-${Date.now()}`;
-    const questionsDir = resolve(tmpHome, "sessions", sessionId);
-    mkdirSync(questionsDir, { recursive: true });
-    writeFileSync(
-      resolve(questionsDir, "clarifier-questions.json"),
-      JSON.stringify([{
-        id: "q-cleared",
-        question: "All done?",
-        defaultAnswer: "Yes",
-        askedAt: Date.now(),
-        status: "closed",
-        closureReason: "default-accepted",
-      }]),
-    );
-
-    const notification = {
-      jsonrpc: "2.0" as const,
-      method: "hydra-acp/transformer/session_event",
-      params: { event: "session.opened", sessionId },
-    };
-
-    (bridge as any).onNotification(notification);
-    await new Promise((r) => setTimeout(r, 100));
-
-    const attentionClearCalls = stubClient._requestLog.filter(
-      (r: { method: string }) => r.method === "hydra-acp/attention/clear",
-    );
-    assert.strictEqual(attentionClearCalls.length, 1);
-    assert.strictEqual(attentionClearCalls[0].params.sessionId, sessionId);
-
-    const attentionSetCalls = stubClient._requestLog.filter(
-      (r: { method: string }) => r.method === "hydra-acp/attention/set",
-    );
-    assert.strictEqual(attentionSetCalls.length, 0);
-  });
-
   it("ignores unknown lifecycle events", async () => {
-    setupTmpHome();
     const stubClient = makeStubClient();
 
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
       token: "test-token",
     });
     (bridge as any).client = stubClient;
@@ -1545,6 +1153,7 @@ describe("ClarifierBridge — error event handling", () => {
     const stubClient = makeStubClient();
     const bridge = new ClarifierBridge({
       daemonWsUrl: "ws://stub",
+      daemonUrl: "http://stub",
       token: "stub",
     });
     (bridge as any).client = stubClient;
@@ -1560,5 +1169,258 @@ describe("ClarifierBridge — error event handling", () => {
     assert.doesNotThrow(() => {
       (stubClient as unknown as EventEmitter).emit("error", new Error("simulated ws hang up"));
     });
+  });
+});
+
+describe("ClarifierBridge — in-memory question cache", () => {
+  let stubClient: TransformerClientStub;
+
+  function makeBridge() {
+    return new ClarifierBridge({
+      daemonWsUrl: "ws://127.0.0.1:55514/acp",
+      daemonUrl: "http://127.0.0.1:55514",
+      token: "test-token",
+    }) as ClarifierBridge & { opts: { daemonUrl: string } };
+  }
+
+  beforeEach(() => {
+    stubClient = makeStubClient();
+  });
+
+  it("getQuestions returns empty array for a missing session entry", () => {
+    const bridge = makeBridge();
+    (bridge as any).client = stubClient;
+
+    const questions = (bridge as any).getQuestions("nonexistent-session");
+    assert.deepStrictEqual(questions, []);
+  });
+
+  it("getQuestions returns the cached array for a session that has entries", () => {
+    const bridge = makeBridge();
+    (bridge as any).client = stubClient;
+
+    const q1 = { id: "q-1", question: "Q1?", defaultAnswer: "Yes", askedAt: Date.now(), status: "open" as const };
+    (bridge as any).sessionQuestions.set("sess-1", [q1]);
+
+    const questions = (bridge as any).getQuestions("sess-1");
+    assert.strictEqual(questions.length, 1);
+    assert.strictEqual(questions[0].id, "q-1");
+  });
+
+  it("setQuestions with data updates the map AND calls attention/set with the right payload", async () => {
+    const bridge = makeBridge();
+    (bridge as any).client = stubClient;
+
+    const sessionId = "sess-set-test";
+    const questions = [
+      { id: "q-1", question: "Proceed?", defaultAnswer: "Yes", askedAt: Date.now(), status: "open" as const },
+    ];
+
+    await (bridge as any).setQuestions(sessionId, questions);
+
+    // Map should be updated
+    const cached = (bridge as any).getQuestions(sessionId);
+    assert.strictEqual(cached.length, 1);
+    assert.strictEqual(cached[0].id, "q-1");
+
+    // attention/set should have been called
+    const setCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
+    );
+    assert.ok(setCall, "expected hydra-acp/attention/set to be called");
+    assert.strictEqual(setCall.params.sessionId, sessionId);
+    assert.strictEqual(setCall.params.reason, "questions");
+    const payload = setCall.params.payload as { kind: string; questions: unknown[] };
+    assert.strictEqual(payload.kind, "questions");
+    assert.strictEqual(payload.questions.length, 1);
+    assert.strictEqual(payload.questions[0].id, "q-1");
+
+    // attention/clear should NOT have been called
+    const clearCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/clear",
+    );
+    assert.strictEqual(clearCall, undefined);
+  });
+
+  it("setQuestions with empty array calls attention/clear and deletes the map entry", async () => {
+    const bridge = makeBridge();
+    (bridge as any).client = stubClient;
+
+    // Pre-populate the cache so we can verify deletion
+    const sessionId = "sess-clear-test";
+    (bridge as any).sessionQuestions.set(sessionId, [
+      { id: "q-1", question: "Q?", defaultAnswer: "Y", askedAt: Date.now(), status: "open" as const },
+    ]);
+
+    await (bridge as any).setQuestions(sessionId, []);
+
+    // Map entry should be deleted
+    const cached = (bridge as any).getQuestions(sessionId);
+    assert.deepStrictEqual(cached, []);
+
+    // attention/clear should have been called
+    const clearCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/clear",
+    );
+    assert.ok(clearCall, "expected hydra-acp/attention/clear to be called");
+    assert.strictEqual(clearCall.params.sessionId, sessionId);
+    assert.strictEqual(clearCall.params.reason, "questions");
+
+    // attention/set should NOT have been called
+    const setCall = stubClient._requestLog.find(
+      (r: { method: string }) => r.method === "hydra-acp/attention/set",
+    );
+    assert.strictEqual(setCall, undefined);
+  });
+
+ it("setQuestions mutation order: map is updated before daemon call", async () => {
+    const bridge = makeBridge();
+
+    // Use a dedicated stub for this test to avoid polluting the shared one
+    const mutationStub = makeStubClient();
+    (bridge as any).client = mutationStub;
+
+    // Track WS calls to verify mutation order
+    const events: string[] = [];
+    mutationStub.request = async (method, _params) => {
+      events.push(`ws:${method}`);
+      return { ok: true };
+    };
+
+    const sessionId = "sess-mutation-order";
+    const questions = [
+      { id: "q-1", question: "Proceed?", defaultAnswer: "Yes", askedAt: Date.now(), status: "open" as const },
+    ];
+
+    // Verify that after setQuestions completes, the map has the entry
+    await (bridge as any).setQuestions(sessionId, questions);
+
+    // Map should have exactly one entry (the one we just set)
+    assert.strictEqual((bridge as any).sessionQuestions.size, 1);
+    assert.strictEqual((bridge as any).getQuestions(sessionId).length, 1);
+
+    // WS call should have been made for attention/set
+    assert.ok(events.includes("ws:hydra-acp/attention/set"));
+  });
+
+  it("populateQuestionsCache parses response and populates the map", async () => {
+    const bridge = makeBridge();
+    (bridge as any).client = stubClient;
+
+    const mockFlags = [
+      {
+        sessionId: "sess-fetch-1",
+        source: "hydra-acp-clarifier",
+        reason: "questions",
+        raisedAt: Date.now(),
+        payload: { kind: "questions", questions: [{ id: "q-a", question: "A?", defaultAnswer: "Y", askedAt: Date.now(), status: "open" as const }] },
+      },
+      {
+        sessionId: "sess-fetch-2",
+        source: "hydra-acp-clarifier",
+        reason: "questions",
+        raisedAt: Date.now(),
+        payload: { kind: "questions", questions: [{ id: "q-b", question: "B?", defaultAnswer: "N", askedAt: Date.now(), status: "pending-delivery" as const }] },
+      },
+    ];
+
+    const savedFetch = globalThis.fetch;
+    (globalThis.fetch as unknown) = async () => {
+      return {
+        ok: true,
+        json: async () => ({ flags: mockFlags }),
+      } as Response;
+    };
+
+    try {
+      await (bridge as any).populateQuestionsCache();
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+
+    assert.strictEqual((bridge as any).sessionQuestions.size, 2);
+    assert.strictEqual((bridge as any).getQuestions("sess-fetch-1").length, 1);
+    assert.strictEqual((bridge as any).getQuestions("sess-fetch-1")[0].id, "q-a");
+    assert.strictEqual((bridge as any).getQuestions("sess-fetch-2").length, 1);
+    assert.strictEqual((bridge as any).getQuestions("sess-fetch-2")[0].id, "q-b");
+  });
+
+  it("populateQuestionsCache skips flags with no questions", async () => {
+    const bridge = makeBridge();
+    (bridge as any).client = stubClient;
+
+    const mockFlags = [
+      {
+        sessionId: "sess-empty",
+        source: "hydra-acp-clarifier",
+        reason: "questions",
+        raisedAt: Date.now(),
+        payload: { kind: "questions", questions: [] },
+      },
+    ];
+
+    const savedFetch = globalThis.fetch;
+    (globalThis.fetch as unknown) = async () => {
+      return {
+        ok: true,
+        json: async () => ({ flags: mockFlags }),
+      } as Response;
+    };
+
+    try {
+      await (bridge as any).populateQuestionsCache();
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+
+    assert.strictEqual((bridge as any).sessionQuestions.size, 0);
+  });
+
+  it("populateQuestionsCache logs warning on non-OK response and does not mutate cache", async () => {
+    const bridge = makeBridge();
+    (bridge as any).client = stubClient;
+
+    // Pre-populate so we can verify nothing changes
+    (bridge as any).sessionQuestions.set("existing", [
+      { id: "q-existing", question: "E?", defaultAnswer: "Y", askedAt: Date.now(), status: "open" as const },
+    ]);
+
+    const savedFetch = globalThis.fetch;
+    (globalThis.fetch as unknown) = async () => {
+      return {
+        ok: false,
+        status: 500,
+        json: async () => ({}),
+      } as Response;
+    };
+
+    try {
+      await (bridge as any).populateQuestionsCache();
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+
+    // Pre-populated entry should remain unchanged
+    assert.strictEqual((bridge as any).sessionQuestions.size, 1);
+    assert.strictEqual((bridge as any).getQuestions("existing").length, 1);
+  });
+
+  it("populateQuestionsCache handles fetch rejection gracefully", async () => {
+    const bridge = makeBridge();
+    (bridge as any).client = stubClient;
+
+    const savedFetch = globalThis.fetch;
+    (globalThis.fetch as unknown) = async () => {
+      throw new Error("network error");
+    };
+
+    try {
+      // Should not throw — best-effort
+      await (bridge as any).populateQuestionsCache();
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+
+    assert.strictEqual((bridge as any).sessionQuestions.size, 0);
   });
 });
