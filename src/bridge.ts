@@ -227,7 +227,7 @@ export class ClarifierBridge {
     }
 
     const dispatchKey = `${phase}:${method}`;
-    log.debug(`transformer/message: ${dispatchKey} session=${sessionId}`);
+    log.info(`transformer/message: ${dispatchKey} session=${sessionId}`);
 
     switch (dispatchKey) {
       case "request:hydra-acp/question/answer":

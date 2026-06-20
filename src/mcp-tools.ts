@@ -5,26 +5,62 @@
 // blocking on user input.
 
 export const CLARIFIER_MCP_INSTRUCTIONS = `\
-Tools for recording and managing deferred questions during a \
-conversational turn. Use these when you want to note assumptions, \
-clarify requirements, or flag decisions that need user input without \
-blocking the current turn.
+Tools for surfacing the deferred decisions you make while working — \
+the small judgment calls a thoughtful collaborator would normally \
+just resolve silently, but where the user might have preferred \
+otherwise.
 
-When to use:
-  - Use note_question when you make an assumption you'd like the user \
-    to confirm but can proceed without; do not block the turn waiting.
-  - Use list_open_questions to check what questions are still open \
-    (especially after compaction or mid-turn).
-  - Use dismiss_question when a question is no longer relevant and \
-    you want to clean it up.
+Why this matters:
+  Every non-trivial task contains decisions you have to make to keep \
+  moving — naming, file layout, error semantics, backoff strategy, \
+  preserving public APIs, when to refactor adjacent code, etc. You \
+  pick a default and proceed. If your default differs from what the \
+  user would have chosen, they only discover that AFTER reading your \
+  output — when redirecting your work is expensive. note_question \
+  surfaces those decisions cheaply, while they're still in flight, \
+  without blocking your turn.
 
-Workflow:
-  1. When you make an assumption worth flagging, call note_question \
-     with the question text, your default answer, and optional \
-     suggested options. The turn continues immediately.
-  2. If you need to check what's still pending, call list_open_questions.
-  3. Once a question has been answered or is no longer relevant, \
-     dismiss it with dismiss_question.\
+The non-blocking property is the whole point:
+  You DO NOT wait for the user. You pick a sensible default, call \
+  note_question to record the decision (with the default + any \
+  reasonable alternatives), and continue working. The user reviews \
+  your noted questions when convenient; if they disagree with a \
+  default, their answer is injected into your next turn as a \
+  directive. If they don't push back, your default stands.
+
+When to call note_question:
+  - You're refactoring and decide whether to preserve existing public \
+    method names. Default: preserve. → note it.
+  - You're adding retries and pick exponential backoff with 3 attempts. \
+    → note it.
+  - You're migrating storage and decide to leave old files on disk \
+    rather than delete. → note it.
+  - You're naming a new module and picked one of three plausible names. \
+    → note it.
+  - You're touching adjacent code that wasn't strictly in scope but \
+    seemed worth tidying. → note it.
+
+When NOT to call note_question:
+  - The decision is required before you can take ANY action ("which \
+    of these three files do you mean?"). Ask the user directly in \
+    your reply — note_question is for deferred decisions, not \
+    blocking ones.
+  - The decision has only one defensible answer (no real choice to \
+    surface).
+  - You've already noted a substantively similar question this turn.
+
+Use sparingly but not stingily — a turn that surfaces 1–3 deferred \
+decisions on a non-trivial task is the sweet spot. Zero on a \
+refactor with real judgment calls usually means you silently \
+assumed something the user might have wanted to weigh in on; five \
+on the same task usually means you flagged trivia.
+
+Other tools:
+  - list_open_questions returns the session's pending questions \
+    (useful after compaction or to check whether the user has \
+    answered).
+  - dismiss_question closes a question that's no longer relevant \
+    (e.g. you've since learned the answer from context).\
 `;
 
 export interface ClarifierMcpTool {
@@ -37,7 +73,7 @@ export const CLARIFIER_MCP_TOOLS: ClarifierMcpTool[] = [
   {
     name: "note_question",
     description:
-      'Record a deferred question for the user. Use when you make an assumption you would like confirmed but can proceed without — call this and keep going, do not block the turn waiting for an answer. Returns "noted" immediately. Generates a question id internally.',
+      'Surface a deferred decision you are making mid-task — pick a sensible default and call this to flag the choice for the user, then continue working without waiting. Use whenever you make a judgment call the user might have preferred otherwise (naming, error semantics, scope creep, refactor style, retry policy, etc.); the user reviews noted questions when convenient and any disagreement is injected into your next turn as a directive. If they say nothing, your default stands. Do NOT use this for blocking questions where you need an answer before acting at all — ask directly in your reply for those. Returns "noted" immediately; generates a question id internally.',
     inputSchema: {
       type: "object",
       required: ["question", "default_answer"],

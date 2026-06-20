@@ -81,8 +81,11 @@ describe("CLARIFIER_MCP_TOOLS", () => {
       "instructions should mention note_question",
     );
     assert.ok(
-      CLARIFIER_MCP_INSTRUCTIONS.toLowerCase().includes("do not block"),
-      "instructions should say not to block the turn",
+      CLARIFIER_MCP_INSTRUCTIONS.toLowerCase().includes("without blocking") ||
+        CLARIFIER_MCP_INSTRUCTIONS.toLowerCase().includes("non-blocking") ||
+        CLARIFIER_MCP_INSTRUCTIONS.toLowerCase().includes("do not block") ||
+        CLARIFIER_MCP_INSTRUCTIONS.toLowerCase().includes("do not wait"),
+      "instructions should convey the non-blocking property",
     );
   });
 });
