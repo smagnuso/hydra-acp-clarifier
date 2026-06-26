@@ -614,7 +614,7 @@ export class ClarifierBridge {
         const msg = (err as Error).message ?? "";
         if (msg.includes("not found")) {
           // Cold session — schedule a retry. Picked up the next time the
-          // user opens the session in the TUI (which marks it live).
+          // user opens the session in the TUI (which marks it warm).
           this.pendingAttach.add(sessionId);
           this.ensureActivationTimer();
           log.debug(`self-attach deferred for ${sessionId} (cold)`);
